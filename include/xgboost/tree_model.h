@@ -1,5 +1,5 @@
 /**
- * Copyright 2014-2023 by Contributors
+ * Copyright 2014-2024, XGBoost Contributors
  * \file tree_model.h
  * \brief model structure for tree
  * \author Tianqi Chen
@@ -398,8 +398,8 @@ class RegTree : public Model {
       if (!func(nidx)) {
         return;
       }
-      auto left = self[nidx].LeftChild();
-      auto right = self[nidx].RightChild();
+      auto left = self.LeftChild(nidx);
+      auto right = self.RightChild(nidx);
       if (left != RegTree::kInvalidNodeId) {
         nodes.push(left);
       }
@@ -687,6 +687,9 @@ class RegTree : public Model {
       return this->p_mt_tree_->DefaultLeft(nidx);
     }
     return (*this)[nidx].DefaultLeft();
+  }
+  [[nodiscard]] bst_node_t DefaultChild(bst_node_t nidx) const {
+    return this->DefaultLeft(nidx) ? this->LeftChild(nidx) : this->RightChild(nidx);
   }
   [[nodiscard]] bool IsRoot(bst_node_t nidx) const {
     if (IsMultiTarget()) {

@@ -7,6 +7,7 @@ needed, run CMake .
     If this is a RC release, the version for JVM packages has the form
     <major>.<minor>.<patch>-RC1
 """
+
 import argparse
 import datetime
 import os
@@ -61,8 +62,11 @@ def pypkg(
 
 
 @cd(R_PACKAGE)
-def rpkg(major: int, minor: int, patch: int) -> None:
-    version = f"{major}.{minor}.{patch}.1"
+def rpkg(major: int, minor: int, patch: int, is_dev: bool) -> None:
+    if is_dev:
+        version = f"{major}.{minor}.{patch}.0"
+    else:
+        version = f"{major}.{minor}.{patch}.1"
     # Version: 2.0.0.1
     desc_path = "DESCRIPTION"
     with open(desc_path, "r") as fd:
@@ -119,8 +123,8 @@ def main(args: argparse.Namespace) -> None:
     minor = args.minor
     patch = args.patch
     rc = args.rc
-    is_rc = args.is_rc == 1
-    is_dev = args.is_dev == 1
+    is_rc = args.is_rc
+    is_dev = args.is_dev
     if is_rc and is_dev:
         raise ValueError("It cannot be both a rc and a dev branch.")
     if is_rc:
@@ -130,7 +134,7 @@ def main(args: argparse.Namespace) -> None:
 
     cmake(major, minor, patch)
     pypkg(major, minor, patch, rc, is_rc, is_dev)
-    rpkg(major, minor, patch)
+    rpkg(major, minor, patch, is_dev=is_dev)
     jvmpkgs(major, minor, patch, rc, is_rc, is_dev)
 
     print(
@@ -149,8 +153,8 @@ if __name__ == "__main__":
     parser.add_argument("--minor", type=int)
     parser.add_argument("--patch", type=int)
     parser.add_argument("--rc", type=int, default=0)
-    parser.add_argument("--is-rc", type=int, choices=[0, 1])
-    parser.add_argument("--is-dev", type=int, choices=[0, 1])
+    parser.add_argument("--is-rc", action="store_true")
+    parser.add_argument("--is-dev", action="store_true")
     args = parser.parse_args()
     try:
         main(args)

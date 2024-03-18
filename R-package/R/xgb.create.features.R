@@ -51,7 +51,7 @@
 #' dtrain <- with(agaricus.train, xgb.DMatrix(data, label = label, nthread = 2))
 #' dtest <- with(agaricus.test, xgb.DMatrix(data, label = label, nthread = 2))
 #'
-#' param <- list(max_depth=2, eta=1, silent=1, objective='binary:logistic')
+#' param <- list(max_depth=2, eta=1, objective='binary:logistic')
 #' nrounds = 4
 #'
 #' bst = xgb.train(params = param, data = dtrain, nrounds = nrounds, nthread = 2)
@@ -71,7 +71,6 @@
 #' new.dtest <- xgb.DMatrix(
 #'   data = new.features.test, label = agaricus.test$label, nthread = 2
 #' )
-#' watchlist <- list(train = new.dtrain)
 #' bst <- xgb.train(params = param, data = new.dtrain, nrounds = nrounds, nthread = 2)
 #'
 #' # Model accuracy with new features

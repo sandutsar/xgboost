@@ -11,11 +11,9 @@
 #include "../../../src/common/linalg_op.h"
 #include "../helpers.h"
 
-namespace xgboost {
-namespace metric {
-
+namespace xgboost::metric {
 inline void CheckDeterministicMetricElementWise(StringView name, int32_t device) {
-  auto ctx = CreateEmptyGenericParam(device);
+  auto ctx = MakeCUDACtx(device);
   std::unique_ptr<Metric> metric{Metric::Create(name.c_str(), &ctx)};
 
   HostDeviceVector<float> predts;
@@ -46,7 +44,7 @@ inline void CheckDeterministicMetricElementWise(StringView name, int32_t device)
 }
 
 inline void VerifyRMSE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   xgboost::Metric * metric = xgboost::Metric::Create("rmse", &ctx);
   metric->Configure({});
   ASSERT_STREQ(metric->Name(), "rmse");
@@ -75,7 +73,7 @@ inline void VerifyRMSE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
 }
 
 inline void VerifyRMSLE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   xgboost::Metric * metric = xgboost::Metric::Create("rmsle", &ctx);
   metric->Configure({});
   ASSERT_STREQ(metric->Name(), "rmsle");
@@ -104,7 +102,7 @@ inline void VerifyRMSLE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
 }
 
 inline void VerifyMAE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   xgboost::Metric * metric = xgboost::Metric::Create("mae", &ctx);
   metric->Configure({});
   ASSERT_STREQ(metric->Name(), "mae");
@@ -133,7 +131,7 @@ inline void VerifyMAE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
 }
 
 inline void VerifyMAPE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   xgboost::Metric * metric = xgboost::Metric::Create("mape", &ctx);
   metric->Configure({});
   ASSERT_STREQ(metric->Name(), "mape");
@@ -162,7 +160,7 @@ inline void VerifyMAPE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
 }
 
 inline void VerifyMPHE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   std::unique_ptr<xgboost::Metric> metric{xgboost::Metric::Create("mphe", &ctx)};
   metric->Configure({});
   ASSERT_STREQ(metric->Name(), "mphe");
@@ -197,7 +195,7 @@ inline void VerifyMPHE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
 }
 
 inline void VerifyLogLoss(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   xgboost::Metric * metric = xgboost::Metric::Create("logloss", &ctx);
   metric->Configure({});
   ASSERT_STREQ(metric->Name(), "logloss");
@@ -230,7 +228,7 @@ inline void VerifyLogLoss(DataSplitMode data_split_mode = DataSplitMode::kRow) {
 }
 
 inline void VerifyError(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   xgboost::Metric * metric = xgboost::Metric::Create("error", &ctx);
   metric->Configure({});
   ASSERT_STREQ(metric->Name(), "error");
@@ -292,7 +290,7 @@ inline void VerifyError(DataSplitMode data_split_mode = DataSplitMode::kRow) {
 }
 
 inline void VerifyPoissonNegLogLik(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   xgboost::Metric * metric = xgboost::Metric::Create("poisson-nloglik", &ctx);
   metric->Configure({});
   ASSERT_STREQ(metric->Name(), "poisson-nloglik");
@@ -325,14 +323,14 @@ inline void VerifyPoissonNegLogLik(DataSplitMode data_split_mode = DataSplitMode
 }
 
 inline void VerifyMultiRMSE(DataSplitMode data_split_mode = DataSplitMode::kRow) {
+  auto ctx = MakeCUDACtx(GPUIDX);
   size_t n_samples = 32, n_targets = 8;
-  linalg::Tensor<float, 2> y{{n_samples, n_targets}, GPUIDX};
+  linalg::Tensor<float, 2> y{{n_samples, n_targets}, ctx.Device()};
   auto &h_y = y.Data()->HostVector();
   std::iota(h_y.begin(), h_y.end(), 0);
 
   HostDeviceVector<float> predt(n_samples * n_targets, 0);
 
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
   std::unique_ptr<Metric> metric{Metric::Create("rmse", &ctx)};
   metric->Configure({});
 
@@ -347,7 +345,7 @@ inline void VerifyMultiRMSE(DataSplitMode data_split_mode = DataSplitMode::kRow)
 }
 
 inline void VerifyQuantile(DataSplitMode data_split_mode = DataSplitMode::kRow) {
-  auto ctx = xgboost::CreateEmptyGenericParam(GPUIDX);
+  auto ctx = MakeCUDACtx(GPUIDX);
   std::unique_ptr<Metric> metric{Metric::Create("quantile", &ctx)};
 
   HostDeviceVector<float> predts{0.1f, 0.9f, 0.1f, 0.9f};
@@ -381,5 +379,4 @@ inline void VerifyQuantile(DataSplitMode data_split_mode = DataSplitMode::kRow) 
   metric->Configure(Args{{"quantile_alpha", "[1.0]"}});
   EXPECT_NEAR(GetMetricEval(metric.get(), predts, labels, {}, {}, data_split_mode), 0.3f, 0.001f);
 }
-}  // namespace metric
-}  // namespace xgboost
+}  // namespace xgboost::metric

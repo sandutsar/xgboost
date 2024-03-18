@@ -31,10 +31,10 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
   dh::XGBCachingDeviceAllocator<char> alloc;
 
   auto num_rows = [&]() {
-    return Dispatch(proxy, [](auto const& value) { return value.NumRows(); });
+    return cuda_impl::Dispatch(proxy, [](auto const& value) { return value.NumRows(); });
   };
   auto num_cols = [&]() {
-    return Dispatch(proxy, [](auto const& value) { return value.NumCols(); });
+    return cuda_impl::Dispatch(proxy, [](auto const& value) { return value.NumCols(); });
   };
 
   size_t row_stride = 0;
@@ -47,9 +47,9 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
 
   int32_t current_device;
   dh::safe_cuda(cudaGetDevice(&current_device));
-  auto get_device = [&]() -> int32_t {
-    std::int32_t d = (ctx->gpu_id == Context::kCpuId) ? current_device : ctx->gpu_id;
-    CHECK_NE(d, Context::kCpuId);
+  auto get_device = [&]() {
+    auto d = (ctx->IsCPU()) ? DeviceOrd::CUDA(current_device) : ctx->Device();
+    CHECK(!d.IsCPU());
     return d;
   };
 
@@ -59,9 +59,8 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
   common::HistogramCuts cuts;
   do {
     // We use do while here as the first batch is fetched in ctor
-    // ctx_.gpu_id = proxy->DeviceIdx();
-    CHECK_LT(ctx->gpu_id, common::AllVisibleGPUs());
-    dh::safe_cuda(cudaSetDevice(get_device()));
+    CHECK_LT(ctx->Ordinal(), common::AllVisibleGPUs());
+    dh::safe_cuda(cudaSetDevice(get_device().ordinal));
     if (cols == 0) {
       cols = num_cols();
       collective::Allreduce<collective::Operation::kMax>(&cols, 1);
@@ -74,15 +73,15 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
                                      get_device());
       auto* p_sketch = &sketch_containers.back();
       proxy->Info().weights_.SetDevice(get_device());
-      Dispatch(proxy, [&](auto const& value) {
+      cuda_impl::Dispatch(proxy, [&](auto const& value) {
         common::AdapterDeviceSketch(value, p.max_bin, proxy->Info(), missing, p_sketch);
       });
     }
     auto batch_rows = num_rows();
     accumulated_rows += batch_rows;
-    dh::caching_device_vector<size_t> row_counts(batch_rows + 1, 0);
+    dh::device_vector<size_t> row_counts(batch_rows + 1, 0);
     common::Span<size_t> row_counts_span(row_counts.data().get(), row_counts.size());
-    row_stride = std::max(row_stride, Dispatch(proxy, [=](auto const& value) {
+    row_stride = std::max(row_stride, cuda_impl::Dispatch(proxy, [=](auto const& value) {
                             return GetRowCounts(value, row_counts_span, get_device(), missing);
                           }));
     nnz += thrust::reduce(thrust::cuda::par(alloc), row_counts.begin(), row_counts.end());
@@ -93,7 +92,7 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
   auto n_features = cols;
   CHECK_GE(n_features, 1) << "Data must has at least 1 column.";
 
-  dh::safe_cuda(cudaSetDevice(get_device()));
+  dh::safe_cuda(cudaSetDevice(get_device().ordinal));
   if (!ref) {
     HostDeviceVector<FeatureType> ft;
     common::SketchContainer final_sketch(
@@ -106,7 +105,7 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
     sketch_containers.clear();
     sketch_containers.shrink_to_fit();
 
-    final_sketch.MakeCuts(&cuts);
+    final_sketch.MakeCuts(ctx, &cuts, this->info_.IsColumnSplit());
   } else {
     GetCutsFromRef(ctx, ref, Info().num_col_, p, &cuts);
   }
@@ -114,7 +113,7 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
   this->info_.num_row_ = accumulated_rows;
   this->info_.num_nonzero_ = nnz;
 
-  auto init_page = [this, &proxy, &cuts, row_stride, accumulated_rows, get_device]() {
+  auto init_page = [this, &cuts, row_stride, accumulated_rows, get_device]() {
     if (!ellpack_) {
       // Should be put inside the while loop to protect against empty batch.  In
       // that case device id is invalid.
@@ -132,18 +131,18 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
   size_t n_batches_for_verification = 0;
   while (iter.Next()) {
     init_page();
-    dh::safe_cuda(cudaSetDevice(get_device()));
+    dh::safe_cuda(cudaSetDevice(get_device().ordinal));
     auto rows = num_rows();
-    dh::caching_device_vector<size_t> row_counts(rows + 1, 0);
+    dh::device_vector<size_t> row_counts(rows + 1, 0);
     common::Span<size_t> row_counts_span(row_counts.data().get(), row_counts.size());
-    Dispatch(proxy, [=](auto const& value) {
+    cuda_impl::Dispatch(proxy, [=](auto const& value) {
       return GetRowCounts(value, row_counts_span, get_device(), missing);
     });
     auto is_dense = this->IsDense();
 
     proxy->Info().feature_types.SetDevice(get_device());
     auto d_feature_types = proxy->Info().feature_types.ConstDeviceSpan();
-    auto new_impl = Dispatch(proxy, [&](auto const& value) {
+    auto new_impl = cuda_impl::Dispatch(proxy, [&](auto const& value) {
       return EllpackPageImpl(value, missing, get_device(), is_dense, row_counts_span,
                              d_feature_types, row_stride, rows, cuts);
     });
@@ -168,7 +167,7 @@ void IterativeDMatrix::InitFromCUDA(Context const* ctx, BatchParam const& p,
 
   iter.Reset();
   // Synchronise worker columns
-  info_.SynchronizeNumberOfColumns();
+  info_.SynchronizeNumberOfColumns(ctx);
 }
 
 BatchSet<EllpackPage> IterativeDMatrix::GetEllpackBatches(Context const* ctx,
@@ -184,18 +183,18 @@ BatchSet<EllpackPage> IterativeDMatrix::GetEllpackBatches(Context const* ctx,
   if (!ellpack_) {
     ellpack_.reset(new EllpackPage());
     if (ctx->IsCUDA()) {
-      this->Info().feature_types.SetDevice(ctx->gpu_id);
+      this->Info().feature_types.SetDevice(ctx->Device());
       *ellpack_->Impl() =
           EllpackPageImpl(ctx, *this->ghist_, this->Info().feature_types.ConstDeviceSpan());
     } else if (fmat_ctx_.IsCUDA()) {
-      this->Info().feature_types.SetDevice(fmat_ctx_.gpu_id);
+      this->Info().feature_types.SetDevice(fmat_ctx_.Device());
       *ellpack_->Impl() =
           EllpackPageImpl(&fmat_ctx_, *this->ghist_, this->Info().feature_types.ConstDeviceSpan());
     } else {
       // Can happen when QDM is initialized on CPU, but a GPU version is queried by a different QDM
       // for cut reference.
       auto cuda_ctx = ctx->MakeCUDA();
-      this->Info().feature_types.SetDevice(cuda_ctx.gpu_id);
+      this->Info().feature_types.SetDevice(cuda_ctx.Device());
       *ellpack_->Impl() =
           EllpackPageImpl(&cuda_ctx, *this->ghist_, this->Info().feature_types.ConstDeviceSpan());
     }

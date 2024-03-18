@@ -9,9 +9,7 @@
 #include "../../../src/data/adapter.h"
 #include "xgboost/context.h"
 
-namespace xgboost {
-namespace common {
-
+namespace xgboost::common {
 TEST(Quantile, LoadBalance) {
   size_t constexpr kRows = 1000, kCols = 100;
   auto m = RandomDataGenerator{kRows, kCols, 0}.GenerateDMatrix();
@@ -52,7 +50,7 @@ void DoTestDistributedQuantile(size_t rows, size_t cols) {
   SimpleLCG lcg;
   SimpleRealUniformDistribution<float> dist(3, 1000);
   std::generate(h_weights.begin(), h_weights.end(), [&]() { return dist(&lcg); });
-  std::vector<bst_row_t> column_size(cols, rows);
+  std::vector<bst_idx_t> column_size(cols, rows);
   bst_bin_t n_bins = 64;
 
   // Generate cuts for distributed environment.
@@ -88,7 +86,7 @@ void DoTestDistributedQuantile(size_t rows, size_t cols) {
   }
 
   HistogramCuts distributed_cuts;
-  sketch_distributed.MakeCuts(m->Info(), &distributed_cuts);
+  sketch_distributed.MakeCuts(&ctx, m->Info(), &distributed_cuts);
 
   // Generate cuts for single node environment
   collective::Finalize();
@@ -119,7 +117,7 @@ void DoTestDistributedQuantile(size_t rows, size_t cols) {
   }
 
   HistogramCuts single_node_cuts;
-  sketch_on_single_node.MakeCuts(m->Info(), &single_node_cuts);
+  sketch_on_single_node.MakeCuts(&ctx, m->Info(), &single_node_cuts);
 
   auto const& sptrs = single_node_cuts.Ptrs();
   auto const& dptrs = distributed_cuts.Ptrs();
@@ -194,7 +192,7 @@ void DoTestColSplitQuantile(size_t rows, size_t cols) {
     return dmat->SliceCol(world, rank);
   }()};
 
-  std::vector<bst_row_t> column_size(cols, 0);
+  std::vector<bst_idx_t> column_size(cols, 0);
   auto const slice_size = cols / world;
   auto const slice_start = slice_size * rank;
   auto const slice_end = (rank == world - 1) ? cols : slice_start + slice_size;
@@ -222,7 +220,7 @@ void DoTestColSplitQuantile(size_t rows, size_t cols) {
       }
     }
 
-    sketch_distributed.MakeCuts(m->Info(), &distributed_cuts);
+    sketch_distributed.MakeCuts(&ctx, m->Info(), &distributed_cuts);
   }
 
   // Generate cuts for single node environment
@@ -245,7 +243,7 @@ void DoTestColSplitQuantile(size_t rows, size_t cols) {
       }
     }
 
-    sketch_on_single_node.MakeCuts(m->Info(), &single_node_cuts);
+    sketch_on_single_node.MakeCuts(&ctx, m->Info(), &single_node_cuts);
   }
 
   auto const& sptrs = single_node_cuts.Ptrs();
@@ -302,7 +300,7 @@ namespace {
 void TestSameOnAllWorkers() {
   auto const world = collective::GetWorldSize();
   constexpr size_t kRows = 1000, kCols = 100;
-  auto ctx = CreateEmptyGenericParam(Context::kCpuId);
+  Context ctx;
 
   RunWithSeedsAndBins(
       kRows, [=, &ctx](int32_t seed, size_t n_bins, MetaInfo const&) {
@@ -314,7 +312,7 @@ void TestSameOnAllWorkers() {
         }
 
         auto m = RandomDataGenerator{kRows, kCols, 0}
-                     .Device(Context::kCpuId)
+                     .Device(DeviceOrd::CPU())
                      .Type(ft)
                      .MaxCategory(17)
                      .Seed(rank + seed)
@@ -373,6 +371,4 @@ TEST(Quantile, SameOnAllWorkers) {
   auto constexpr kWorkers = 4;
   RunWithInMemoryCommunicator(kWorkers, TestSameOnAllWorkers);
 }
-
-}  // namespace common
-}  // namespace xgboost
+}  // namespace xgboost::common

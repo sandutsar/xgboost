@@ -19,11 +19,9 @@
 #include <thrust/unique.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>  // for size_t
 #include <cub/cub.cuh>
 #include <cub/util_allocator.cuh>
-#include <numeric>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -31,14 +29,9 @@
 
 #include "../collective/communicator-inl.h"
 #include "common.h"
-#include "xgboost/global_config.h"
 #include "xgboost/host_device_vector.h"
 #include "xgboost/logging.h"
 #include "xgboost/span.h"
-
-#ifdef XGBOOST_USE_NCCL
-#include "nccl.h"
-#endif  // XGBOOST_USE_NCCL
 
 #if defined(XGBOOST_USE_RMM) && XGBOOST_USE_RMM == 1
 #include "rmm/mr/device/per_device_resource.hpp"
@@ -114,30 +107,6 @@ XGBOOST_DEV_INLINE T atomicAdd(T *addr, T v) {  // NOLINT
   return static_cast<T>(ret);
 }
 namespace dh {
-
-#ifdef XGBOOST_USE_NCCL
-#define safe_nccl(ans) ThrowOnNcclError((ans), __FILE__, __LINE__)
-
-inline ncclResult_t ThrowOnNcclError(ncclResult_t code, const char *file, int line) {
-  if (code != ncclSuccess) {
-    std::stringstream ss;
-    ss << "NCCL failure: " << ncclGetErrorString(code) << ".";
-    ss << " " << file << "(" << line << ")\n";
-    if (code == ncclUnhandledCudaError) {
-      // nccl usually preserves the last error so we can get more details.
-      auto err = cudaPeekAtLastError();
-      ss << "  CUDA error: " << thrust::system_error(err, thrust::cuda_category()).what() << "\n";
-    } else if (code == ncclSystemError) {
-      ss << "  This might be caused by a network configuration issue. Please consider specifying "
-            "the network interface for NCCL via environment variables listed in its reference: "
-            "`https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html`.\n";
-    }
-    LOG(FATAL) << ss.str();
-  }
-
-  return code;
-}
-#endif
 
 inline int32_t CudaGetPointerDevice(void const *ptr) {
   int32_t device = -1;
@@ -313,8 +282,8 @@ inline void LaunchN(size_t n, L lambda) {
 }
 
 template <typename Container>
-void Iota(Container array) {
-  LaunchN(array.size(), [=] __device__(size_t i) { array[i] = i; });
+void Iota(Container array, cudaStream_t stream) {
+  LaunchN(array.size(), stream, [=] __device__(size_t i) { array[i] = i; });
 }
 
 namespace detail {
@@ -480,7 +449,8 @@ struct XGBCachingDeviceAllocatorImpl : XGBBaseDeviceAllocator<T> {
   cub::CachingDeviceAllocator& GetGlobalCachingAllocator() {
     // Configure allocator with maximum cached bin size of ~1GB and no limit on
     // maximum cached bytes
-    static cub::CachingDeviceAllocator *allocator = new cub::CachingDeviceAllocator(2, 9, 29);
+    thread_local std::unique_ptr<cub::CachingDeviceAllocator> allocator{
+        std::make_unique<cub::CachingDeviceAllocator>(2, 9, 29)};
     return *allocator;
   }
   pointer allocate(size_t n) {  // NOLINT
@@ -595,6 +565,16 @@ class DoubleBuffer {
 
   T *Other() { return buff.Alternate(); }
 };
+
+template <typename T>
+xgboost::common::Span<T> LazyResize(xgboost::Context const *ctx,
+                                    xgboost::HostDeviceVector<T> *buffer, std::size_t n) {
+  buffer->SetDevice(ctx->Device());
+  if (buffer->Size() < n) {
+    buffer->Resize(n);
+  }
+  return buffer->DeviceSpan().subspan(0, n);
+}
 
 /**
  * \brief Copies device span to std::vector.
@@ -824,176 +804,6 @@ template <typename T>
 XGBOOST_DEVICE auto tcrend(xgboost::common::Span<T> const &span) {  // NOLINT
   return tcrbegin(span) + span.size();
 }
-
-// This type sorts an array which is divided into multiple groups. The sorting is influenced
-// by the function object 'Comparator'
-template <typename T>
-class SegmentSorter {
- private:
-  // Items sorted within the group
-  caching_device_vector<T> ditems_;
-
-  // Original position of the items before they are sorted descending within their groups
-  caching_device_vector<uint32_t> doriginal_pos_;
-
-  // Segments within the original list that delineates the different groups
-  caching_device_vector<uint32_t> group_segments_;
-
-  // Need this on the device as it is used in the kernels
-  caching_device_vector<uint32_t> dgroups_;       // Group information on device
-
-  // Where did the item that was originally present at position 'x' move to after they are sorted
-  caching_device_vector<uint32_t> dindexable_sorted_pos_;
-
-  // Initialize everything but the segments
-  void Init(uint32_t num_elems) {
-    ditems_.resize(num_elems);
-
-    doriginal_pos_.resize(num_elems);
-    thrust::sequence(doriginal_pos_.begin(), doriginal_pos_.end());
-  }
-
-  // Initialize all with group info
-  void Init(const std::vector<uint32_t> &groups) {
-    uint32_t num_elems = groups.back();
-    this->Init(num_elems);
-    this->CreateGroupSegments(groups);
-  }
-
- public:
-  // This needs to be public due to device lambda
-  void CreateGroupSegments(const std::vector<uint32_t> &groups) {
-    uint32_t num_elems = groups.back();
-    group_segments_.resize(num_elems, 0);
-
-    dgroups_ = groups;
-
-    if (GetNumGroups() == 1) return;  // There are no segments; hence, no need to compute them
-
-    // Define the segments by assigning a group ID to each element
-    const uint32_t *dgroups = dgroups_.data().get();
-    uint32_t ngroups = dgroups_.size();
-    auto ComputeGroupIDLambda = [=] __device__(uint32_t idx) {
-      return thrust::upper_bound(thrust::seq, dgroups, dgroups + ngroups, idx) -
-             dgroups - 1;
-    };  // NOLINT
-
-    thrust::transform(thrust::make_counting_iterator(static_cast<uint32_t>(0)),
-                      thrust::make_counting_iterator(num_elems),
-                      group_segments_.begin(),
-                      ComputeGroupIDLambda);
-  }
-
-  // Accessors that returns device pointer
-  inline uint32_t GetNumItems() const { return ditems_.size(); }
-  inline const xgboost::common::Span<const T> GetItemsSpan() const {
-    return { ditems_.data().get(), ditems_.size() };
-  }
-
-  inline const xgboost::common::Span<const uint32_t> GetOriginalPositionsSpan() const {
-    return { doriginal_pos_.data().get(), doriginal_pos_.size() };
-  }
-
-  inline const xgboost::common::Span<const uint32_t> GetGroupSegmentsSpan() const {
-    return { group_segments_.data().get(), group_segments_.size() };
-  }
-
-  inline uint32_t GetNumGroups() const { return dgroups_.size() - 1; }
-  inline const xgboost::common::Span<const uint32_t> GetGroupsSpan() const {
-    return { dgroups_.data().get(), dgroups_.size() };
-  }
-
-  inline const xgboost::common::Span<const uint32_t> GetIndexableSortedPositionsSpan() const {
-    return { dindexable_sorted_pos_.data().get(), dindexable_sorted_pos_.size() };
-  }
-
-  // Sort an array that is divided into multiple groups. The array is sorted within each group.
-  // This version provides the group information that is on the host.
-  // The array is sorted based on an adaptable binary predicate. By default a stateless predicate
-  // is used.
-  template <typename Comparator = thrust::greater<T>>
-  void SortItems(const T *ditems, uint32_t item_size, const std::vector<uint32_t> &groups,
-                 const Comparator &comp = Comparator()) {
-    this->Init(groups);
-    this->SortItems(ditems, item_size, this->GetGroupSegmentsSpan(), comp);
-  }
-
-  // Sort an array that is divided into multiple groups. The array is sorted within each group.
-  // This version provides the group information that is on the device.
-  // The array is sorted based on an adaptable binary predicate. By default a stateless predicate
-  // is used.
-  template <typename Comparator = thrust::greater<T>>
-  void SortItems(const T *ditems, uint32_t item_size,
-                 const xgboost::common::Span<const uint32_t> &group_segments,
-                 const Comparator &comp = Comparator()) {
-    this->Init(item_size);
-
-    // Sort the items that are grouped. We would like to avoid using predicates to perform the sort,
-    // as thrust resorts to using a merge sort as opposed to a much much faster radix sort
-    // when comparators are used. Hence, the following algorithm is used. This is done so that
-    // we can grab the appropriate related values from the original list later, after the
-    // items are sorted.
-    //
-    // Here is the internal representation:
-    // dgroups_:          [ 0, 3, 5, 8, 10 ]
-    // group_segments_:   0 0 0 | 1 1 | 2 2 2 | 3 3
-    // doriginal_pos_:    0 1 2 | 3 4 | 5 6 7 | 8 9
-    // ditems_:           1 0 1 | 2 1 | 1 3 3 | 4 4 (from original items)
-    //
-    // Sort the items first and make a note of the original positions in doriginal_pos_
-    // based on the sort
-    // ditems_:           4 4 3 3 2 1 1 1 1 0
-    // doriginal_pos_:    8 9 6 7 3 0 2 4 5 1
-    // NOTE: This consumes space, but is much faster than some of the other approaches - sorting
-    //       in kernel, sorting using predicates etc.
-
-    ditems_.assign(thrust::device_ptr<const T>(ditems),
-                   thrust::device_ptr<const T>(ditems) + item_size);
-
-    // Allocator to be used by sort for managing space overhead while sorting
-    dh::XGBCachingDeviceAllocator<char> alloc;
-
-    thrust::stable_sort_by_key(thrust::cuda::par(alloc),
-                               ditems_.begin(), ditems_.end(),
-                               doriginal_pos_.begin(), comp);
-
-    if (GetNumGroups() == 1) return;  // The entire array is sorted, as it isn't segmented
-
-    // Next, gather the segments based on the doriginal_pos_. This is to reflect the
-    // holisitic item sort order on the segments
-    // group_segments_c_:   3 3 2 2 1 0 0 1 2 0
-    // doriginal_pos_:      8 9 6 7 3 0 2 4 5 1 (stays the same)
-    caching_device_vector<uint32_t> group_segments_c(item_size);
-    thrust::gather(doriginal_pos_.begin(), doriginal_pos_.end(),
-                   dh::tcbegin(group_segments), group_segments_c.begin());
-
-    // Now, sort the group segments so that you may bring the items within the group together,
-    // in the process also noting the relative changes to the doriginal_pos_ while that happens
-    // group_segments_c_:   0 0 0 1 1 2 2 2 3 3
-    // doriginal_pos_:      0 2 1 3 4 6 7 5 8 9
-    thrust::stable_sort_by_key(thrust::cuda::par(alloc),
-                               group_segments_c.begin(), group_segments_c.end(),
-                               doriginal_pos_.begin(), thrust::less<uint32_t>());
-
-    // Finally, gather the original items based on doriginal_pos_ to sort the input and
-    // to store them in ditems_
-    // doriginal_pos_:      0 2 1 3 4 6 7 5 8 9  (stays the same)
-    // ditems_:             1 1 0 2 1 3 3 1 4 4  (from unsorted items - ditems)
-    thrust::gather(doriginal_pos_.begin(), doriginal_pos_.end(),
-                   thrust::device_ptr<const T>(ditems), ditems_.begin());
-  }
-
-  // Determine where an item that was originally present at position 'x' has been relocated to
-  // after a sort. Creation of such an index has to be explicitly requested after a sort
-  void CreateIndexableSortedPositions() {
-    dindexable_sorted_pos_.resize(GetNumItems());
-    thrust::scatter(thrust::make_counting_iterator(static_cast<uint32_t>(0)),
-                    thrust::make_counting_iterator(GetNumItems()),  // Rearrange indices...
-                    // ...based on this map
-                    dh::tcbegin(GetOriginalPositionsSpan()),
-                    dindexable_sorted_pos_.begin());  // Write results into this
-  }
-};
 
 // Atomic add function for gradients
 template <typename OutputGradientT, typename InputGradientT>
@@ -1229,74 +1039,6 @@ void InclusiveSum(InputIteratorT d_in, OutputIteratorT d_out, OffsetT num_items)
   InclusiveScan(d_in, d_out, cub::Sum(), num_items);
 }
 
-template <bool accending, typename IdxT, typename U>
-void ArgSort(xgboost::common::Span<U> keys, xgboost::common::Span<IdxT> sorted_idx) {
-  size_t bytes = 0;
-  Iota(sorted_idx);
-
-  using KeyT = typename decltype(keys)::value_type;
-  using ValueT = std::remove_const_t<IdxT>;
-
-  TemporaryArray<KeyT> out(keys.size());
-  cub::DoubleBuffer<KeyT> d_keys(const_cast<KeyT *>(keys.data()),
-                                 out.data().get());
-  TemporaryArray<IdxT> sorted_idx_out(sorted_idx.size());
-  cub::DoubleBuffer<ValueT> d_values(const_cast<ValueT *>(sorted_idx.data()),
-                                     sorted_idx_out.data().get());
-
-  // track https://github.com/NVIDIA/cub/pull/340 for 64bit length support
-  using OffsetT = std::conditional_t<!BuildWithCUDACub(), std::ptrdiff_t, int32_t>;
-  CHECK_LE(sorted_idx.size(), std::numeric_limits<OffsetT>::max());
-  if (accending) {
-    void *d_temp_storage = nullptr;
-#if THRUST_MAJOR_VERSION >= 2
-    safe_cuda((cub::DispatchRadixSort<false, KeyT, ValueT, OffsetT>::Dispatch(
-        d_temp_storage, bytes, d_keys, d_values, sorted_idx.size(), 0,
-        sizeof(KeyT) * 8, false, nullptr)));
-#else
-    safe_cuda((cub::DispatchRadixSort<false, KeyT, ValueT, OffsetT>::Dispatch(
-        d_temp_storage, bytes, d_keys, d_values, sorted_idx.size(), 0,
-        sizeof(KeyT) * 8, false, nullptr, false)));
-#endif
-    TemporaryArray<char> storage(bytes);
-    d_temp_storage = storage.data().get();
-#if THRUST_MAJOR_VERSION >= 2
-    safe_cuda((cub::DispatchRadixSort<false, KeyT, ValueT, OffsetT>::Dispatch(
-        d_temp_storage, bytes, d_keys, d_values, sorted_idx.size(), 0,
-        sizeof(KeyT) * 8, false, nullptr)));
-#else
-    safe_cuda((cub::DispatchRadixSort<false, KeyT, ValueT, OffsetT>::Dispatch(
-        d_temp_storage, bytes, d_keys, d_values, sorted_idx.size(), 0,
-        sizeof(KeyT) * 8, false, nullptr, false)));
-#endif
-  } else {
-    void *d_temp_storage = nullptr;
-#if THRUST_MAJOR_VERSION >= 2
-    safe_cuda((cub::DispatchRadixSort<true, KeyT, ValueT, OffsetT>::Dispatch(
-        d_temp_storage, bytes, d_keys, d_values, sorted_idx.size(), 0,
-        sizeof(KeyT) * 8, false, nullptr)));
-#else
-    safe_cuda((cub::DispatchRadixSort<true, KeyT, ValueT, OffsetT>::Dispatch(
-        d_temp_storage, bytes, d_keys, d_values, sorted_idx.size(), 0,
-        sizeof(KeyT) * 8, false, nullptr, false)));
-#endif
-    TemporaryArray<char> storage(bytes);
-    d_temp_storage = storage.data().get();
-#if THRUST_MAJOR_VERSION >= 2
-    safe_cuda((cub::DispatchRadixSort<true, KeyT, ValueT, OffsetT>::Dispatch(
-        d_temp_storage, bytes, d_keys, d_values, sorted_idx.size(), 0,
-        sizeof(KeyT) * 8, false, nullptr)));
-#else
-    safe_cuda((cub::DispatchRadixSort<true, KeyT, ValueT, OffsetT>::Dispatch(
-        d_temp_storage, bytes, d_keys, d_values, sorted_idx.size(), 0,
-        sizeof(KeyT) * 8, false, nullptr, false)));
-#endif
-  }
-
-  safe_cuda(cudaMemcpyAsync(sorted_idx.data(), sorted_idx_out.data().get(),
-                            sorted_idx.size_bytes(), cudaMemcpyDeviceToDevice));
-}
-
 class CUDAStreamView;
 
 class CUDAEvent {
@@ -1339,14 +1081,28 @@ class CUDAStreamView {
   operator cudaStream_t() const {  // NOLINT
     return stream_;
   }
-  void Sync() { dh::safe_cuda(cudaStreamSynchronize(stream_)); }
+  cudaError_t Sync(bool error = true) {
+    if (error) {
+      dh::safe_cuda(cudaStreamSynchronize(stream_));
+      return cudaSuccess;
+    }
+    return cudaStreamSynchronize(stream_);
+  }
 };
 
 inline void CUDAEvent::Record(CUDAStreamView stream) {  // NOLINT
   dh::safe_cuda(cudaEventRecord(event_, cudaStream_t{stream}));
 }
 
-inline CUDAStreamView DefaultStream() { return CUDAStreamView{cudaStreamLegacy}; }
+// Changing this has effect on prediction return, where we need to pass the pointer to
+// third-party libraries like cuPy
+inline CUDAStreamView DefaultStream() {
+#ifdef CUDA_API_PER_THREAD_DEFAULT_STREAM
+  return CUDAStreamView{cudaStreamPerThread};
+#else
+  return CUDAStreamView{cudaStreamLegacy};
+#endif
+}
 
 class CUDAStream {
   cudaStream_t stream_;

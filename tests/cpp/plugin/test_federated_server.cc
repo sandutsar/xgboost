@@ -18,6 +18,11 @@ class FederatedServerTest : public BaseFederatedTest {
     CheckAllgather(client, rank);
   }
 
+  static void VerifyAllgatherV(int rank, const std::string& server_address) {
+    federated::FederatedClient client{server_address, rank};
+    CheckAllgatherV(client, rank);
+  }
+
   static void VerifyAllreduce(int rank, const std::string& server_address) {
     federated::FederatedClient client{server_address, rank};
     CheckAllreduce(client);
@@ -39,8 +44,7 @@ class FederatedServerTest : public BaseFederatedTest {
 
  protected:
   static void CheckAllgather(federated::FederatedClient& client, int rank) {
-    int data[kWorldSize] = {0, 0, 0};
-    data[rank] = rank;
+    int data[] = {rank};
     std::string send_buffer(reinterpret_cast<char const*>(data), sizeof(data));
     auto reply = client.Allgather(send_buffer);
     auto const* result = reinterpret_cast<int const*>(reply.data());
@@ -49,12 +53,18 @@ class FederatedServerTest : public BaseFederatedTest {
     }
   }
 
+  static void CheckAllgatherV(federated::FederatedClient& client, int rank) {
+    std::vector<std::string_view> inputs{"Hello,", " World!"};
+    auto reply = client.AllgatherV(inputs[rank]);
+    EXPECT_EQ(reply, "Hello, World!");
+  }
+
   static void CheckAllreduce(federated::FederatedClient& client) {
     int data[] = {1, 2, 3, 4, 5};
     std::string send_buffer(reinterpret_cast<char const*>(data), sizeof(data));
     auto reply = client.Allreduce(send_buffer, federated::INT32, federated::SUM);
     auto const* result = reinterpret_cast<int const*>(reply.data());
-    int expected[] = {3, 6, 9, 12, 15};
+    int expected[] = {2, 4, 6, 8, 10};
     for (auto i = 0; i < 5; i++) {
       EXPECT_EQ(result[i], expected[i]);
     }
@@ -74,6 +84,16 @@ TEST_F(FederatedServerTest, Allgather) {
   std::vector<std::thread> threads;
   for (auto rank = 0; rank < kWorldSize; rank++) {
     threads.emplace_back(&FederatedServerTest::VerifyAllgather, rank, server_->Address());
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+}
+
+TEST_F(FederatedServerTest, AllgatherV) {
+  std::vector<std::thread> threads;
+  for (auto rank = 0; rank < kWorldSize; rank++) {
+    threads.emplace_back(&FederatedServerTest::VerifyAllgatherV, rank, server_->Address());
   }
   for (auto& thread : threads) {
     thread.join();

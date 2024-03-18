@@ -7,6 +7,7 @@ from hypothesis import given, settings, strategies
 import xgboost as xgb
 from xgboost import testing as tm
 from xgboost.testing.data import check_inf
+from xgboost.testing.data_iter import run_mixed_sparsity
 
 sys.path.append("tests/python")
 import test_quantile_dmatrix as tqd
@@ -202,9 +203,7 @@ class TestQuantileDMatrix:
         np.testing.assert_equal(h_ret.indptr, d_ret.indptr)
         np.testing.assert_equal(h_ret.indices, d_ret.indices)
 
-        booster = xgb.train(
-            {"tree_method": "gpu_hist", "predictor": "gpu_predictor"}, dtrain=d_m
-        )
+        booster = xgb.train({"tree_method": "hist", "device": "cuda:0"}, dtrain=d_m)
 
         np.testing.assert_allclose(
             booster.predict(d_m),
@@ -214,6 +213,7 @@ class TestQuantileDMatrix:
 
     def test_ltr(self) -> None:
         import cupy as cp
+
         X, y, qid, w = tm.make_ltr(100, 3, 3, 5)
         # make sure GPU is used to run sketching.
         cpX = cp.array(X)
@@ -232,3 +232,6 @@ class TestQuantileDMatrix:
 
         rng = cp.random.default_rng(1994)
         check_inf(rng)
+
+    def test_mixed_sparsity(self) -> None:
+        run_mixed_sparsity("cuda")

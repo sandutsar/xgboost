@@ -1,23 +1,30 @@
-/*!
- * Copyright (c) by Contributors 2019-2022
+/**
+ * Copyright 2019-2024, XGBoost Contributors
  */
 #include "xgboost/json.h"
 
-#include <dmlc/endian.h>
+#include <array>             // for array
+#include <cctype>            // for isdigit
+#include <cmath>             // for isinf, isnan
+#include <cstdint>           // for uint8_t, uint16_t, uint32_t
+#include <cstdio>            // for EOF
+#include <cstdlib>           // for size_t, strtof
+#include <cstring>           // for memcpy
+#include <initializer_list>  // for initializer_list
+#include <iterator>          // for distance
+#include <limits>            // for numeric_limits
+#include <memory>            // for allocator
+#include <sstream>           // for operator<<, basic_ostream, operator&, ios, stringstream
+#include <system_error>      // for errc
 
-#include <cctype>
-#include <cmath>
-#include <cstddef>
-#include <iterator>
-#include <limits>
-#include <sstream>
-
-#include "./math.h"
-#include "charconv.h"
-#include "xgboost/base.h"
-#include "xgboost/json_io.h"
-#include "xgboost/logging.h"
-#include "xgboost/string_view.h"
+#include "./math.h"                 // for CheckNAN
+#include "charconv.h"               // for to_chars, NumericLimits, from_chars, to_chars_result
+#include "common.h"                 // for EscapeU8
+#include "xgboost/base.h"           // for XGBOOST_EXPECT
+#include "xgboost/intrusive_ptr.h"  // for IntrusivePtr
+#include "xgboost/json_io.h"        // for JsonReader, UBJReader, UBJWriter, JsonWriter, ToBigEn...
+#include "xgboost/logging.h"        // for LOG, LOG_FATAL, LogMessageFatal, LogCheck_NE, CHECK
+#include "xgboost/string_view.h"    // for StringView, operator<<
 
 namespace xgboost {
 
@@ -57,24 +64,25 @@ void JsonWriter::Visit(JsonObject const* obj) {
 }
 
 void JsonWriter::Visit(JsonNumber const* num) {
-  char number[NumericLimits<float>::kToCharsSize];
-  auto res = to_chars(number, number + sizeof(number), num->GetNumber());
+  std::array<char, NumericLimits<float>::kToCharsSize> number;
+  auto res = to_chars(number.data(), number.data() + number.size(), num->GetNumber());
   auto end = res.ptr;
   auto ori_size = stream_->size();
-  stream_->resize(stream_->size() + end - number);
-  std::memcpy(stream_->data() + ori_size, number, end - number);
+  stream_->resize(stream_->size() + end - number.data());
+  std::memcpy(stream_->data() + ori_size, number.data(), end - number.data());
 }
 
 void JsonWriter::Visit(JsonInteger const* num) {
-  char i2s_buffer_[NumericLimits<int64_t>::kToCharsSize];
+  std::array<char, NumericLimits<int64_t>::kToCharsSize> i2s_buffer_;
   auto i = num->GetInteger();
-  auto ret = to_chars(i2s_buffer_, i2s_buffer_ + NumericLimits<int64_t>::kToCharsSize, i);
+  auto ret =
+      to_chars(i2s_buffer_.data(), i2s_buffer_.data() + NumericLimits<int64_t>::kToCharsSize, i);
   auto end = ret.ptr;
   CHECK(ret.ec == std::errc());
-  auto digits = std::distance(i2s_buffer_, end);
+  auto digits = std::distance(i2s_buffer_.data(), end);
   auto ori_size = stream_->size();
   stream_->resize(ori_size + digits);
-  std::memcpy(stream_->data() + ori_size, i2s_buffer_, digits);
+  std::memcpy(stream_->data() + ori_size, i2s_buffer_.data(), digits);
 }
 
 void JsonWriter::Visit(JsonNull const* ) {
@@ -88,43 +96,15 @@ void JsonWriter::Visit(JsonNull const* ) {
 }
 
 void JsonWriter::Visit(JsonString const* str) {
-  std::string buffer;
-  buffer += '"';
-  auto const& string = str->GetString();
-  for (size_t i = 0; i < string.length(); i++) {
-    const char ch = string[i];
-    if (ch == '\\') {
-      if (i < string.size() && string[i+1] == 'u') {
-        buffer += "\\";
-      } else {
-        buffer += "\\\\";
-      }
-    } else if (ch == '"') {
-      buffer += "\\\"";
-    } else if (ch == '\b') {
-      buffer += "\\b";
-    } else if (ch == '\f') {
-      buffer += "\\f";
-    } else if (ch == '\n') {
-      buffer += "\\n";
-    } else if (ch == '\r') {
-      buffer += "\\r";
-    } else if (ch == '\t') {
-      buffer += "\\t";
-    } else if (static_cast<uint8_t>(ch) <= 0x1f) {
-      // Unit separator
-      char buf[8];
-      snprintf(buf, sizeof buf, "\\u%04x", ch);
-      buffer += buf;
-    } else {
-      buffer += ch;
-    }
-  }
-  buffer += '"';
+    std::string buffer;
+    buffer += '"';
+    auto const& string = str->GetString();
+    common::EscapeU8(string, &buffer);
+    buffer += '"';
 
-  auto s = stream_->size();
-  stream_->resize(s + buffer.size());
-  std::memcpy(stream_->data() + s, buffer.data(), buffer.size());
+    auto s = stream_->size();
+    stream_->resize(s + buffer.size());
+    std::memcpy(stream_->data() + s, buffer.data(), buffer.size());
 }
 
 void JsonWriter::Visit(JsonBoolean const* boolean) {
@@ -165,8 +145,10 @@ std::string Value::TypeStr() const {
       return "Null";
     case ValueKind::kInteger:
       return "Integer";
-    case ValueKind::kNumberArray:
+    case ValueKind::kF32Array:
       return "F32Array";
+    case ValueKind::kF64Array:
+      return "F64Array";
     case ValueKind::kU8Array:
       return "U8Array";
     case ValueKind::kI32Array:
@@ -284,10 +266,11 @@ bool JsonTypedArray<T, kind>::operator==(Value const& rhs) const {
   return std::equal(arr.cbegin(), arr.cend(), vec_.cbegin());
 }
 
-template class JsonTypedArray<float, Value::ValueKind::kNumberArray>;
-template class JsonTypedArray<uint8_t, Value::ValueKind::kU8Array>;
-template class JsonTypedArray<int32_t, Value::ValueKind::kI32Array>;
-template class JsonTypedArray<int64_t, Value::ValueKind::kI64Array>;
+template class JsonTypedArray<float, Value::ValueKind::kF32Array>;
+template class JsonTypedArray<double, Value::ValueKind::kF64Array>;
+template class JsonTypedArray<std::uint8_t, Value::ValueKind::kU8Array>;
+template class JsonTypedArray<std::int32_t, Value::ValueKind::kI32Array>;
+template class JsonTypedArray<std::int64_t, Value::ValueKind::kI64Array>;
 
 // Json Number
 bool JsonNumber::operator==(Value const& rhs) const {
@@ -730,6 +713,8 @@ Json UBJReader::ParseArray() {
     switch (type) {
       case 'd':
         return ParseTypedArray<F32Array>(n);
+      case 'D':
+        return ParseTypedArray<F64Array>(n);
       case 'U':
         return ParseTypedArray<U8Array>(n);
       case 'l':
@@ -813,10 +798,14 @@ Json UBJReader::Parse() {
         return Json{JsonBoolean{true}};
       }
       case 'F': {
-        return Json{JsonBoolean{true}};
+        return Json{JsonBoolean{false}};
       }
       case 'd': {
         auto v = this->ReadPrimitive<float>();
+        return Json{v};
+      }
+      case 'D': {
+        auto v = this->ReadPrimitive<double>();
         return Json{v};
       }
       case 'S': {
@@ -846,10 +835,6 @@ Json UBJReader::Parse() {
       case 'C': {
         Integer::Int i = this->ReadPrimitive<char>();
         return Json{i};
-      }
-      case 'D': {
-        LOG(FATAL) << "f64 is not supported.";
-        break;
       }
       case 'H': {
         LOG(FATAL) << "High precision number is not supported.";
@@ -904,6 +889,8 @@ void WriteTypedArray(JsonTypedArray<T, kind> const* arr, std::vector<char>* stre
   stream->push_back('$');
   if (std::is_same<T, float>::value) {
     stream->push_back('d');
+  } else if (std::is_same_v<T, double>) {
+    stream->push_back('D');
   } else if (std::is_same<T, int8_t>::value) {
     stream->push_back('i');
   } else if (std::is_same<T, uint8_t>::value) {
@@ -932,6 +919,7 @@ void WriteTypedArray(JsonTypedArray<T, kind> const* arr, std::vector<char>* stre
 }
 
 void UBJWriter::Visit(F32Array const* arr) { WriteTypedArray(arr, stream_); }
+void UBJWriter::Visit(F64Array const* arr) { WriteTypedArray(arr, stream_); }
 void UBJWriter::Visit(U8Array const* arr) { WriteTypedArray(arr, stream_); }
 void UBJWriter::Visit(I32Array const* arr) { WriteTypedArray(arr, stream_); }
 void UBJWriter::Visit(I64Array const* arr) { WriteTypedArray(arr, stream_); }

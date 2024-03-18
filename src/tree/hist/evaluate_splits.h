@@ -1,16 +1,16 @@
 /**
- * Copyright 2021-2023 by XGBoost Contributors
+ * Copyright 2021-2024, XGBoost Contributors
  */
 #ifndef XGBOOST_TREE_HIST_EVALUATE_SPLITS_H_
 #define XGBOOST_TREE_HIST_EVALUATE_SPLITS_H_
 
-#include <algorithm>                   // for copy
-#include <cstddef>                     // for size_t
-#include <limits>                      // for numeric_limits
-#include <memory>                      // for shared_ptr
-#include <numeric>                     // for accumulate
-#include <utility>                     // for move
-#include <vector>                      // for vector
+#include <algorithm>  // for copy
+#include <cstddef>    // for size_t
+#include <limits>     // for numeric_limits
+#include <memory>     // for shared_ptr
+#include <numeric>    // for accumulate
+#include <utility>    // for move
+#include <vector>     // for vector
 
 #include "../../common/categorical.h"  // for CatBitField
 #include "../../common/hist_util.h"    // for GHistRow, HistogramCuts
@@ -20,11 +20,53 @@
 #include "../param.h"                  // for TrainParam
 #include "../split_evaluator.h"        // for TreeEvaluator
 #include "expand_entry.h"              // for MultiExpandEntry
+#include "hist_cache.h"                // for BoundedHistCollection
 #include "xgboost/base.h"              // for bst_node_t, bst_target_t, bst_feature_t
 #include "xgboost/context.h"           // for COntext
 #include "xgboost/linalg.h"            // for Constants, Vector
 
 namespace xgboost::tree {
+/**
+ * @brief Gather the expand entries from all the workers.
+ * @param entries Local expand entries on this worker.
+ * @return Global expand entries gathered from all workers.
+ */
+template <typename ExpandEntry>
+std::enable_if_t<std::is_same_v<ExpandEntry, CPUExpandEntry> ||
+                     std::is_same_v<ExpandEntry, MultiExpandEntry>,
+                 std::vector<ExpandEntry>>
+AllgatherColumnSplit(std::vector<ExpandEntry> const &entries) {
+  auto const n_entries = entries.size();
+
+  // First, gather all the primitive fields.
+  std::vector<ExpandEntry> local_entries(n_entries);
+
+  // Collect and serialize all entries
+  std::vector<std::vector<char>> serialized_entries;
+  for (std::size_t i = 0; i < n_entries; ++i) {
+    Json jentry{Object{}};
+    entries[i].Save(&jentry);
+
+    std::vector<char> out;
+    Json::Dump(jentry, &out, std::ios::binary);
+
+    serialized_entries.emplace_back(std::move(out));
+  }
+  auto all_serialized = collective::VectorAllgatherV(serialized_entries);
+  CHECK_GE(all_serialized.size(), local_entries.size());
+
+  std::vector<ExpandEntry> all_entries(all_serialized.size());
+  std::transform(all_serialized.cbegin(), all_serialized.cend(), all_entries.begin(),
+                 [](std::vector<char> const &e) {
+                   ExpandEntry entry;
+                   auto je = Json::Load(StringView{e.data(), e.size()}, std::ios::binary);
+                   entry.Load(je);
+                   return entry;
+                 });
+
+  return all_entries;
+}
+
 class HistEvaluator {
  private:
   struct NodeEntry {
@@ -35,8 +77,8 @@ class HistEvaluator {
   };
 
  private:
-  Context const* ctx_;
-  TrainParam const* param_;
+  Context const *ctx_;
+  TrainParam const *param_;
   std::shared_ptr<common::ColumnSampler> column_sampler_;
   TreeEvaluator tree_evaluator_;
   bool is_col_split_{false};
@@ -65,7 +107,7 @@ class HistEvaluator {
    *        pseudo-category for missing value but here we just do a complete scan to avoid
    *        making specialized histogram bin.
    */
-  void EnumerateOneHot(common::HistogramCuts const &cut, const common::GHistRow &hist,
+  void EnumerateOneHot(common::HistogramCuts const &cut, common::ConstGHistRow hist,
                        bst_feature_t fidx, bst_node_t nidx,
                        TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
                        SplitEntry *p_best) const {
@@ -143,7 +185,7 @@ class HistEvaluator {
    */
   template <int d_step>
   void EnumeratePart(common::HistogramCuts const &cut, common::Span<size_t const> sorted_idx,
-                     common::GHistRow const &hist, bst_feature_t fidx, bst_node_t nidx,
+                     common::ConstGHistRow hist, bst_feature_t fidx, bst_node_t nidx,
                      TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
                      SplitEntry *p_best) {
     static_assert(d_step == +1 || d_step == -1, "Invalid step.");
@@ -201,7 +243,7 @@ class HistEvaluator {
       common::CatBitField cat_bits{best.cat_bits};
       bst_bin_t partition = d_step == 1 ? (best_thresh - it_begin + 1) : (best_thresh - f_begin);
       CHECK_GT(partition, 0);
-      std::for_each(sorted_idx.begin(), sorted_idx.begin() + partition, [&](size_t c) {
+      std::for_each(sorted_idx.begin(), sorted_idx.begin() + partition, [&](std::size_t c) {
         auto cat = cut_val[c + f_begin];
         cat_bits.Set(cat);
       });
@@ -214,7 +256,7 @@ class HistEvaluator {
   // Returns the sum of gradients corresponding to the data points that contains
   // a non-missing value for the particular feature fid.
   template <int d_step>
-  GradStats EnumerateSplit(common::HistogramCuts const &cut, const common::GHistRow &hist,
+  GradStats EnumerateSplit(common::HistogramCuts const &cut, common::ConstGHistRow hist,
                            bst_feature_t fidx, bst_node_t nidx,
                            TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
                            SplitEntry *p_best) const {
@@ -284,58 +326,23 @@ class HistEvaluator {
     return left_sum;
   }
 
-  /**
-   * @brief Gather the expand entries from all the workers.
-   * @param entries Local expand entries on this worker.
-   * @return Global expand entries gathered from all workers.
-   */
-  std::vector<CPUExpandEntry> Allgather(std::vector<CPUExpandEntry> const &entries) {
-    auto const world = collective::GetWorldSize();
-    auto const rank = collective::GetRank();
-    auto const num_entries = entries.size();
-
-    // First, gather all the primitive fields.
-    std::vector<CPUExpandEntry> all_entries(num_entries * world);
-    std::vector<uint32_t> cat_bits;
-    std::vector<std::size_t> cat_bits_sizes;
-    for (std::size_t i = 0; i < num_entries; i++) {
-      all_entries[num_entries * rank + i].CopyAndCollect(entries[i], &cat_bits, &cat_bits_sizes);
-    }
-    collective::Allgather(all_entries.data(), all_entries.size() * sizeof(CPUExpandEntry));
-
-    // Gather all the cat_bits.
-    auto gathered = collective::AllgatherV(cat_bits, cat_bits_sizes);
-
-    common::ParallelFor(num_entries * world, ctx_->Threads(), [&] (auto i) {
-      // Copy the cat_bits back into all expand entries.
-      all_entries[i].split.cat_bits.resize(gathered.sizes[i]);
-      std::copy_n(gathered.result.cbegin() + gathered.offsets[i], gathered.sizes[i],
-                  all_entries[i].split.cat_bits.begin());
-    });
-
-    return all_entries;
-  }
-
  public:
-  void EvaluateSplits(const common::HistCollection &hist, common::HistogramCuts const &cut,
+  void EvaluateSplits(const BoundedHistCollection &hist, common::HistogramCuts const &cut,
                       common::Span<FeatureType const> feature_types, const RegTree &tree,
                       std::vector<CPUExpandEntry> *p_entries) {
     auto n_threads = ctx_->Threads();
-    auto& entries = *p_entries;
+    auto &entries = *p_entries;
     // All nodes are on the same level, so we can store the shared ptr.
-    std::vector<std::shared_ptr<HostDeviceVector<bst_feature_t>>> features(
-        entries.size());
+    std::vector<std::shared_ptr<HostDeviceVector<bst_feature_t>>> features(entries.size());
     for (size_t nidx_in_set = 0; nidx_in_set < entries.size(); ++nidx_in_set) {
       auto nidx = entries[nidx_in_set].nid;
-      features[nidx_in_set] =
-          column_sampler_->GetFeatureSet(tree.GetDepth(nidx));
+      features[nidx_in_set] = column_sampler_->GetFeatureSet(tree.GetDepth(nidx));
     }
     CHECK(!features.empty());
-    const size_t grain_size =
-        std::max<size_t>(1, features.front()->Size() / n_threads);
-    common::BlockedSpace2d space(entries.size(), [&](size_t nidx_in_set) {
-      return features[nidx_in_set]->Size();
-    }, grain_size);
+    const size_t grain_size = std::max<size_t>(1, features.front()->Size() / n_threads);
+    common::BlockedSpace2d space(
+        entries.size(), [&](size_t nidx_in_set) { return features[nidx_in_set]->Size(); },
+        grain_size);
 
     std::vector<CPUExpandEntry> tloc_candidates(n_threads * entries.size());
     for (size_t i = 0; i < entries.size(); ++i) {
@@ -344,7 +351,7 @@ class HistEvaluator {
       }
     }
     auto evaluator = tree_evaluator_.GetEvaluator();
-    auto const& cut_ptrs = cut.Ptrs();
+    auto const &cut_ptrs = cut.Ptrs();
 
     common::ParallelFor2d(space, n_threads, [&](size_t nidx_in_set, common::Range1d r) {
       auto tidx = omp_get_thread_num();
@@ -385,18 +392,16 @@ class HistEvaluator {
       }
     });
 
-    for (unsigned nidx_in_set = 0; nidx_in_set < entries.size();
-         ++nidx_in_set) {
+    for (unsigned nidx_in_set = 0; nidx_in_set < entries.size(); ++nidx_in_set) {
       for (auto tidx = 0; tidx < n_threads; ++tidx) {
-        entries[nidx_in_set].split.Update(
-            tloc_candidates[n_threads * nidx_in_set + tidx].split);
+        entries[nidx_in_set].split.Update(tloc_candidates[n_threads * nidx_in_set + tidx].split);
       }
     }
 
     if (is_col_split_) {
       // With column-wise data split, we gather the best splits from all the workers and update the
       // expand entries accordingly.
-      auto all_entries = Allgather(entries);
+      auto all_entries = AllgatherColumnSplit(entries);
       for (auto worker = 0; worker < collective::GetWorldSize(); ++worker) {
         for (std::size_t nidx_in_set = 0; nidx_in_set < entries.size(); ++nidx_in_set) {
           entries[nidx_in_set].split.Update(
@@ -407,7 +412,7 @@ class HistEvaluator {
   }
 
   // Add splits to tree, handles all statistic
-  void ApplyTreeSplit(CPUExpandEntry const& candidate, RegTree *p_tree) {
+  void ApplyTreeSplit(CPUExpandEntry const &candidate, RegTree *p_tree) {
     auto evaluator = tree_evaluator_.GetEvaluator();
     RegTree &tree = *p_tree;
 
@@ -437,8 +442,7 @@ class HistEvaluator {
     auto left_child = tree[candidate.nid].LeftChild();
     auto right_child = tree[candidate.nid].RightChild();
     tree_evaluator_.AddSplit(candidate.nid, left_child, right_child,
-                             tree[candidate.nid].SplitIndex(), left_weight,
-                             right_weight);
+                             tree[candidate.nid].SplitIndex(), left_weight, right_weight);
     evaluator = tree_evaluator_.GetEvaluator();
 
     snode_.resize(tree.GetNodes().size());
@@ -449,13 +453,12 @@ class HistEvaluator {
     snode_.at(right_child).root_gain =
         evaluator.CalcGain(candidate.nid, *param_, GradStats{candidate.split.right_sum});
 
-    interaction_constraints_.Split(candidate.nid,
-                                   tree[candidate.nid].SplitIndex(), left_child,
+    interaction_constraints_.Split(candidate.nid, tree[candidate.nid].SplitIndex(), left_child,
                                    right_child);
   }
 
-  auto Evaluator() const { return tree_evaluator_.GetEvaluator(); }
-  auto const& Stats() const { return snode_; }
+  [[nodiscard]] auto Evaluator() const { return tree_evaluator_.GetEvaluator(); }
+  [[nodiscard]] auto const &Stats() const { return snode_; }
 
   float InitRoot(GradStats const &root_sum) {
     snode_.resize(1);
@@ -476,7 +479,7 @@ class HistEvaluator {
       : ctx_{ctx},
         param_{param},
         column_sampler_{std::move(sampler)},
-        tree_evaluator_{*param, static_cast<bst_feature_t>(info.num_col_), Context::kCpuId},
+        tree_evaluator_{*param, static_cast<bst_feature_t>(info.num_col_), DeviceOrd::CPU()},
         is_col_split_{info.IsColumnSplit()} {
     interaction_constraints_.Configure(*param, info.num_col_);
     column_sampler_->Init(ctx, info.num_col_, info.feature_weights.HostVector(),
@@ -510,7 +513,7 @@ class HistMultiEvaluator {
 
   template <bst_bin_t d_step>
   bool EnumerateSplit(common::HistogramCuts const &cut, bst_feature_t fidx,
-                      common::Span<common::GHistRow const> hist,
+                      common::Span<common::ConstGHistRow> hist,
                       linalg::VectorView<GradientPairPrecise const> parent_sum, double parent_gain,
                       SplitEntryContainer<std::vector<GradientPairPrecise>> *p_best) const {
     auto const &cut_ptr = cut.Ptrs();
@@ -571,59 +574,8 @@ class HistMultiEvaluator {
     return false;
   }
 
-  /**
-   * @brief Gather the expand entries from all the workers.
-   * @param entries Local expand entries on this worker.
-   * @return Global expand entries gathered from all workers.
-   */
-  std::vector<MultiExpandEntry> Allgather(std::vector<MultiExpandEntry> const &entries) {
-    auto const world = collective::GetWorldSize();
-    auto const rank = collective::GetRank();
-    auto const num_entries = entries.size();
-
-    // First, gather all the primitive fields.
-    std::vector<MultiExpandEntry> all_entries(num_entries * world);
-    std::vector<uint32_t> cat_bits;
-    std::vector<std::size_t> cat_bits_sizes;
-    std::vector<GradientPairPrecise> gradients;
-    for (std::size_t i = 0; i < num_entries; i++) {
-      all_entries[num_entries * rank + i].CopyAndCollect(entries[i], &cat_bits, &cat_bits_sizes,
-                                                         &gradients);
-    }
-    collective::Allgather(all_entries.data(), all_entries.size() * sizeof(MultiExpandEntry));
-
-    // Gather all the cat_bits.
-    auto gathered_cat_bits = collective::AllgatherV(cat_bits, cat_bits_sizes);
-
-    // Gather all the gradients.
-    auto const num_gradients = gradients.size();
-    std::vector<GradientPairPrecise> all_gradients(num_gradients * world);
-    std::copy_n(gradients.cbegin(), num_gradients, all_gradients.begin() + num_gradients * rank);
-    collective::Allgather(all_gradients.data(), all_gradients.size() * sizeof(GradientPairPrecise));
-
-    auto const total_entries = num_entries * world;
-    auto const gradients_per_entry = num_gradients / num_entries;
-    auto const gradients_per_side = gradients_per_entry / 2;
-    common::ParallelFor(total_entries, ctx_->Threads(), [&] (auto i) {
-      // Copy the cat_bits back into all expand entries.
-      all_entries[i].split.cat_bits.resize(gathered_cat_bits.sizes[i]);
-      std::copy_n(gathered_cat_bits.result.cbegin() + gathered_cat_bits.offsets[i],
-                  gathered_cat_bits.sizes[i], all_entries[i].split.cat_bits.begin());
-
-      // Copy the gradients back into all expand entries.
-      all_entries[i].split.left_sum.resize(gradients_per_side);
-      std::copy_n(all_gradients.cbegin() + i * gradients_per_entry, gradients_per_side,
-                  all_entries[i].split.left_sum.begin());
-      all_entries[i].split.right_sum.resize(gradients_per_side);
-      std::copy_n(all_gradients.cbegin() + i * gradients_per_entry + gradients_per_side,
-                  gradients_per_side, all_entries[i].split.right_sum.begin());
-    });
-
-    return all_entries;
-  }
-
  public:
-  void EvaluateSplits(RegTree const &tree, common::Span<const common::HistCollection *> hist,
+  void EvaluateSplits(RegTree const &tree, common::Span<const BoundedHistCollection *> hist,
                       common::HistogramCuts const &cut, std::vector<MultiExpandEntry> *p_entries) {
     auto &entries = *p_entries;
     std::vector<std::shared_ptr<HostDeviceVector<bst_feature_t>>> features(entries.size());
@@ -651,9 +603,9 @@ class HistMultiEvaluator {
       auto entry = &tloc_candidates[n_threads * nidx_in_set + tidx];
       auto best = &entry->split;
       auto parent_sum = stats_.Slice(entry->nid, linalg::All());
-      std::vector<common::GHistRow> node_hist;
+      std::vector<common::ConstGHistRow> node_hist;
       for (auto t_hist : hist) {
-        node_hist.push_back((*t_hist)[entry->nid]);
+        node_hist.emplace_back((*t_hist)[entry->nid]);
       }
       auto features_set = features[nidx_in_set]->ConstHostSpan();
 
@@ -680,7 +632,7 @@ class HistMultiEvaluator {
     if (is_col_split_) {
       // With column-wise data split, we gather the best splits from all the workers and update the
       // expand entries accordingly.
-      auto all_entries = Allgather(entries);
+      auto all_entries = AllgatherColumnSplit(entries);
       for (auto worker = 0; worker < collective::GetWorldSize(); ++worker) {
         for (std::size_t nidx_in_set = 0; nidx_in_set < entries.size(); ++nidx_in_set) {
           entries[nidx_in_set].split.Update(
@@ -695,7 +647,7 @@ class HistMultiEvaluator {
     stats_ = linalg::Constant(ctx_, GradientPairPrecise{}, 1, n_targets);
     gain_.resize(1);
 
-    linalg::Vector<float> weight({n_targets}, ctx_->gpu_id);
+    linalg::Vector<float> weight({n_targets}, ctx_->Device());
     CalcWeight(*param_, root_sum, weight.HostView());
     auto root_gain = CalcGainGivenWeight(*param_, root_sum, weight.HostView());
     gain_.front() = root_gain;
@@ -734,6 +686,9 @@ class HistMultiEvaluator {
 
     std::size_t n_nodes = p_tree->Size();
     gain_.resize(n_nodes);
+    // Re-calculate weight without learning rate.
+    CalcWeight(*param_, left_sum, left_weight);
+    CalcWeight(*param_, right_sum, right_weight);
     gain_[left_child] = CalcGainGivenWeight(*param_, left_sum, left_weight);
     gain_[right_child] = CalcGainGivenWeight(*param_, right_sum, right_weight);
 
@@ -773,7 +728,7 @@ void UpdatePredictionCacheImpl(Context const *ctx, RegTree const *p_last_tree,
                                std::vector<Partitioner> const &partitioner,
                                linalg::VectorView<float> out_preds) {
   auto const &tree = *p_last_tree;
-  CHECK_EQ(out_preds.DeviceIdx(), Context::kCpuId);
+  CHECK(out_preds.Device().IsCPU());
   size_t n_nodes = p_last_tree->GetNodes().size();
   for (auto &part : partitioner) {
     CHECK_EQ(part.Size(), n_nodes);
@@ -808,7 +763,7 @@ void UpdatePredictionCacheImpl(Context const *ctx, RegTree const *p_last_tree,
   auto n_nodes = mttree->Size();
   auto n_targets = tree.NumTargets();
   CHECK_EQ(out_preds.Shape(1), n_targets);
-  CHECK_EQ(out_preds.DeviceIdx(), Context::kCpuId);
+  CHECK(out_preds.Device().IsCPU());
 
   for (auto &part : partitioner) {
     CHECK_EQ(part.Size(), n_nodes);

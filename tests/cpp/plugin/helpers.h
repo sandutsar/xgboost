@@ -1,5 +1,5 @@
-/*!
- * Copyright 2022-2023 XGBoost contributors
+/**
+ * Copyright 2022-2023, XGBoost contributors
  */
 #pragma once
 
@@ -23,10 +23,10 @@ class ServerForTest {
   std::unique_ptr<grpc::Server> server_;
 
  public:
-  explicit ServerForTest(std::int32_t world_size) {
+  explicit ServerForTest(std::size_t world_size) {
     server_thread_.reset(new std::thread([this, world_size] {
       grpc::ServerBuilder builder;
-      xgboost::federated::FederatedService service{world_size};
+      xgboost::federated::FederatedService service{static_cast<std::int32_t>(world_size)};
       int selected_port;
       builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(), &selected_port);
       builder.RegisterService(&service);
@@ -37,7 +37,14 @@ class ServerForTest {
   }
 
   ~ServerForTest() {
+    using namespace std::chrono_literals;
+    while (!server_) {
+      std::this_thread::sleep_for(100ms);
+    }
     server_->Shutdown();
+    while (!server_thread_) {
+      std::this_thread::sleep_for(100ms);
+    }
     server_thread_->join();
   }
 
@@ -56,7 +63,7 @@ class BaseFederatedTest : public ::testing::Test {
 
   void TearDown() override { server_.reset(nullptr); }
 
-  static int constexpr kWorldSize{3};
+  static int constexpr kWorldSize{2};
   std::unique_ptr<ServerForTest> server_;
 };
 
@@ -66,6 +73,7 @@ void RunWithFederatedCommunicator(int32_t world_size, std::string const& server_
   auto run = [&](auto rank) {
     Json config{JsonObject()};
     config["xgboost_communicator"] = String("federated");
+    config["federated_secure"] = false;
     config["federated_server_address"] = String(server_address);
     config["federated_world_size"] = world_size;
     config["federated_rank"] = rank;

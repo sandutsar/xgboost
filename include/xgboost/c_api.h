@@ -144,9 +144,7 @@ XGB_DLL int XGDMatrixCreateFromFile(const char *fname, int silent, DMatrixHandle
  *            See :doc:`/tutorials/input_format` for more info.
  *          \endverbatim
  *   - silent (optional): Whether to print message during loading. Default to true.
- *   - data_split_mode (optional): Whether to split by row or column. In distributed mode, the
- *     file is split accordingly; otherwise this is only an indicator on how the file was split
- *     beforehand. Default to row.
+ *   - data_split_mode (optional): Whether the file was split by row or column beforehand for distributed computing. Default to row.
  * \param out a loaded data matrix
  * \return 0 when success, -1 when failure happens
  */
@@ -161,6 +159,16 @@ XGB_DLL int XGDMatrixCreateFromURI(char const *config, DMatrixHandle *out);
 XGB_DLL int XGDMatrixCreateFromCSREx(const size_t *indptr, const unsigned *indices,
                                      const float *data, size_t nindptr, size_t nelem,
                                      size_t num_col, DMatrixHandle *out);
+/**
+ * @brief Create a DMatrix from columnar data. (table)
+ *
+ * @param data   See @ref XGBoosterPredictFromColumnar for details.
+ * @param config See @ref XGDMatrixCreateFromDense for details.
+ * @param out    The created dmatrix.
+ *
+ * @return 0 when success, -1 when failure happens
+ */
+XGB_DLL int XGDMatrixCreateFromColumnar(char const *data, char const *config, DMatrixHandle *out);
 
 /**
  * @example c-api-demo.c
@@ -174,6 +182,7 @@ XGB_DLL int XGDMatrixCreateFromCSREx(const size_t *indptr, const unsigned *indic
  * \param config  JSON encoded configuration.  Required values are:
  *   - missing: Which value to represent missing value.
  *   - nthread (optional): Number of threads used for initializing DMatrix.
+ *   - data_split_mode (optional): Whether the data was split by row or column beforehand. Default to row.
  * \param out created dmatrix
  * \return 0 when success, -1 when failure happens
  */
@@ -186,6 +195,7 @@ XGB_DLL int XGDMatrixCreateFromCSR(char const *indptr, char const *indices, char
  * \param config JSON encoded configuration.  Required values are:
  *   - missing: Which value to represent missing value.
  *   - nthread (optional): Number of threads used for initializing DMatrix.
+ *   - data_split_mode (optional): Whether the data was split by row or column beforehand. Default to row.
  * \param out created dmatrix
  * \return 0 when success, -1 when failure happens
  */
@@ -200,6 +210,7 @@ XGB_DLL int XGDMatrixCreateFromDense(char const *data, char const *config, DMatr
  * \param config  JSON encoded configuration.  Supported values are:
  *   - missing: Which value to represent missing value.
  *   - nthread (optional): Number of threads used for initializing DMatrix.
+ *   - data_split_mode (optional): Whether the data was split by row or column beforehand. Default to row.
  * \param out created dmatrix
  * \return 0 when success, -1 when failure happens
  */
@@ -266,6 +277,7 @@ XGB_DLL int XGDMatrixCreateFromDT(void** data,
  * \param config JSON encoded configuration.  Required values are:
  *   - missing: Which value to represent missing value.
  *   - nthread (optional): Number of threads used for initializing DMatrix.
+ *   - data_split_mode (optional): Whether the data was split by row or column beforehand. Default to row.
  * \param out created dmatrix
  * \return 0 when success, -1 when failure happens
  */
@@ -278,6 +290,7 @@ XGB_DLL int XGDMatrixCreateFromCudaColumnar(char const *data, char const *config
  * \param config JSON encoded configuration.  Required values are:
  *   - missing: Which value to represent missing value.
  *   - nthread (optional): Number of threads used for initializing DMatrix.
+ *   - data_split_mode (optional): Whether the data was split by row or column beforehand. Default to row.
  * \param out created dmatrix
  * \return 0 when success, -1 when failure happens
  */
@@ -478,7 +491,7 @@ XGB_DLL int XGDMatrixCreateFromCallback(DataIterHandle iter, DMatrixHandle proxy
  * \param config   JSON encoded parameters for DMatrix construction.  Accepted fields are:
  *   - missing:      Which value to represent missing value
  *   - nthread (optional): Number of threads used for initializing DMatrix.
- *   - max_bin (optional):  Maximum number of bins for building histogram.
+ *   - max_bin (optional): Maximum number of bins for building histogram.
  * \param out      The created Device Quantile DMatrix
  *
  * \return 0 when success, -1 when failure happens
@@ -510,6 +523,16 @@ XGB_DLL int XGDeviceQuantileDMatrixCreateFromCallback(DataIterHandle iter, DMatr
 XGB_DLL int
 XGProxyDMatrixSetDataCudaArrayInterface(DMatrixHandle handle,
                                         const char *c_interface_str);
+
+/**
+ * @brief Set columnar (table) data on a DMatrix proxy.
+ *
+ * @param handle          A DMatrix proxy created by @ref XGProxyDMatrixCreate
+ * @param c_interface_str See @ref XGBoosterPredictFromColumnar for details.
+ *
+ * @return 0 when success, -1 when failure happens
+ */
+XGB_DLL int XGProxyDMatrixSetDataColumnar(DMatrixHandle handle, char const *c_interface_str);
 
 /*!
  * \brief Set data on a DMatrix proxy.
@@ -551,24 +574,6 @@ XGB_DLL int XGProxyDMatrixSetDataCSR(DMatrixHandle handle, char const *indptr,
                                      bst_ulong ncol);
 
 /** @} */  // End of Streaming
-
-XGB_DLL int XGImportArrowRecordBatch(DataIterHandle data_handle, void *ptr_array, void *ptr_schema);
-
-/*!
- * \brief Construct DMatrix from arrow using callbacks.  Arrow related C API is not stable
- *        and subject to change in the future.
- *
- * \param next   Callback function for fetching arrow records.
- * \param config JSON encoded configuration.  Required values are:
- *   - missing: Which value to represent missing value.
- *   - nbatch: Number of batches in arrow table.
- *   - nthread (optional): Number of threads used for initializing DMatrix.
- * \param out      The created DMatrix.
- *
- * \return 0 when success, -1 when failure happens
- */
-XGB_DLL int XGDMatrixCreateFromArrowCallback(XGDMatrixCallbackNext *next, char const *config,
-                                             DMatrixHandle *out);
 
 /*!
  * \brief create a new dmatrix from sliced content of existing matrix
@@ -789,16 +794,14 @@ XGB_DLL int XGDMatrixGetUIntInfo(const DMatrixHandle handle,
  * \param out The address to hold number of rows.
  * \return 0 when success, -1 when failure happens
  */
-XGB_DLL int XGDMatrixNumRow(DMatrixHandle handle,
-                            bst_ulong *out);
+XGB_DLL int XGDMatrixNumRow(DMatrixHandle handle, bst_ulong *out);
 /*!
  * \brief get number of columns
  * \param handle the handle to the DMatrix
  * \param out The output of number of columns
  * \return 0 when success, -1 when failure happens
  */
-XGB_DLL int XGDMatrixNumCol(DMatrixHandle handle,
-                            bst_ulong *out);
+XGB_DLL int XGDMatrixNumCol(DMatrixHandle handle, bst_ulong *out);
 
 /*!
  * \brief Get number of valid values from DMatrix.
@@ -811,6 +814,16 @@ XGB_DLL int XGDMatrixNumCol(DMatrixHandle handle,
 XGB_DLL int XGDMatrixNumNonMissing(DMatrixHandle handle, bst_ulong *out);
 
 /*!
+ * \brief Get the data split mode from DMatrix.
+ *
+ * \param handle the handle to the DMatrix
+ * \param out The output of the data split mode
+ *
+ * \return 0 when success, -1 when failure happens
+ */
+XGB_DLL int XGDMatrixDataSplitMode(DMatrixHandle handle, bst_ulong *out);
+
+/**
  * \brief Get the predictors from DMatrix as CSR matrix for testing.  If this is a
  *        quantized DMatrix, quantized values are returned instead.
  *
@@ -819,8 +832,10 @@ XGB_DLL int XGDMatrixNumNonMissing(DMatrixHandle handle, bst_ulong *out);
  * XGBoost. This is to avoid allocating a huge memory buffer that can not be freed until
  * exiting the thread.
  *
+ * @since 1.7.0
+ *
  * \param handle the handle to the DMatrix
- * \param config Json configuration string. At the moment it should be an empty document,
+ * \param config JSON configuration string. At the moment it should be an empty document,
  *               preserved for future use.
  * \param out_indptr  indptr of output CSR matrix.
  * \param out_indices Column index of output CSR matrix.
@@ -830,6 +845,24 @@ XGB_DLL int XGDMatrixNumNonMissing(DMatrixHandle handle, bst_ulong *out);
  */
 XGB_DLL int XGDMatrixGetDataAsCSR(DMatrixHandle const handle, char const *config,
                                   bst_ulong *out_indptr, unsigned *out_indices, float *out_data);
+
+/**
+ * @brief Export the quantile cuts used for training histogram-based models like `hist` and
+ *        `approx`. Useful for model compression.
+ *
+ * @since 2.0.0
+ *
+ * @param handle the handle to the DMatrix
+ * @param config JSON configuration string. At the moment it should be an empty document,
+ *               preserved for future use.
+ *
+ * @param out_indptr indptr of output CSC matrix represented by a JSON encoded
+ *                   __(cuda_)array_interface__.
+ * @param out_data   Data value of CSC matrix represented by a JSON encoded
+ *                   __(cuda_)array_interface__.
+ */
+XGB_DLL int XGDMatrixGetQuantileCut(DMatrixHandle const handle, char const *config,
+                                     char const **out_indptr, char const **out_data);
 
 /** @} */  // End of DMatrix
 
@@ -925,21 +958,30 @@ XGB_DLL int XGBoosterUpdateOneIter(BoosterHandle handle, int iter, DMatrixHandle
  * @example c-api-demo.c
  */
 
-/*!
- * \brief update the model, by directly specify gradient and second order gradient,
- *        this can be used to replace UpdateOneIter, to support customized loss function
- * \param handle handle
- * \param dtrain training data
- * \param grad gradient statistics
- * \param hess second order gradient statistics
- * \param len length of grad/hess array
- * \return 0 when success, -1 when failure happens
+/**
+ * @deprecated since 2.1.0
  */
-XGB_DLL int XGBoosterBoostOneIter(BoosterHandle handle,
-                                  DMatrixHandle dtrain,
-                                  float *grad,
-                                  float *hess,
-                                  bst_ulong len);
+XGB_DLL int XGBoosterBoostOneIter(BoosterHandle handle, DMatrixHandle dtrain, float *grad,
+                                  float *hess, bst_ulong len);
+
+/**
+ * @brief Update a model with gradient and Hessian. This is used for training with a
+ *        custom objective function.
+ *
+ * @since 2.0.0
+ *
+ * @param handle handle
+ * @param dtrain The training data.
+ * @param iter   The current iteration round. When training continuation is used, the count
+ *               should restart.
+ * @param grad   Json encoded __(cuda)_array_interface__ for gradient.
+ * @param hess   Json encoded __(cuda)_array_interface__ for Hessian.
+ *
+ * @return 0 when success, -1 when failure happens
+ */
+XGB_DLL int XGBoosterTrainOneIter(BoosterHandle handle, DMatrixHandle dtrain, int iter,
+                                  char const *grad, char const *hess);
+
 /*!
  * \brief get evaluation statistics for xgboost
  * \param handle handle
@@ -1067,6 +1109,9 @@ XGB_DLL int XGBoosterPredictFromDMatrix(BoosterHandle handle, DMatrixHandle dmat
 /**
  * \brief Inplace prediction from CPU dense matrix.
  *
+ * \note If the booster is configured to run on a CUDA device, XGBoost falls back to run
+ *       prediction with DMatrix with a performance warning.
+ *
  * \param handle        Booster handle.
  * \param values        JSON encoded __array_interface__ to values.
  * \param config        See \ref XGBoosterPredictFromDMatrix for more info.
@@ -1089,7 +1134,35 @@ XGB_DLL int XGBoosterPredictFromDense(BoosterHandle handle, char const *values, 
  */
 
 /**
+ * @brief Inplace prediction from CPU columnar data. (Table)
+ *
+ * @note If the booster is configured to run on a CUDA device, XGBoost falls back to run
+ *       prediction with DMatrix with a performance warning.
+ *
+ * @param handle        Booster handle.
+ * @param values        An JSON array of __array_interface__ for each column.
+ * @param config        See @ref XGBoosterPredictFromDMatrix for more info.
+ *   Additional fields for inplace prediction are:
+ *     - "missing": float
+ * @param m             An optional (NULL if not available) proxy DMatrix instance
+ *                      storing meta info.
+ *
+ * @param out_shape     See @ref XGBoosterPredictFromDMatrix for more info.
+ * @param out_dim       See @ref XGBoosterPredictFromDMatrix for more info.
+ * @param out_result    See @ref XGBoosterPredictFromDMatrix for more info.
+ *
+ * @return 0 when success, -1 when failure happens
+ */
+XGB_DLL int XGBoosterPredictFromColumnar(BoosterHandle handle, char const *array_interface,
+                                         char const *c_json_config, DMatrixHandle m,
+                                         bst_ulong const **out_shape, bst_ulong *out_dim,
+                                         const float **out_result);
+
+/**
  * \brief Inplace prediction from CPU CSR matrix.
+ *
+ * \note If the booster is configured to run on a CUDA device, XGBoost falls back to run
+ *       prediction with DMatrix with a performance warning.
  *
  * \param handle        Booster handle.
  * \param indptr        JSON encoded __array_interface__ to row pointer in CSR.
@@ -1116,6 +1189,9 @@ XGB_DLL int XGBoosterPredictFromCSR(BoosterHandle handle, char const *indptr, ch
 /**
  * \brief Inplace prediction from CUDA Dense matrix (cupy in Python).
  *
+ * \note If the booster is configured to run on a CPU, XGBoost falls back to run
+ *       prediction with DMatrix with a performance warning.
+ *
  * \param handle        Booster handle
  * \param values        JSON encoded __cuda_array_interface__ to values.
  * \param config        See \ref XGBoosterPredictFromDMatrix for more info.
@@ -1136,6 +1212,9 @@ XGB_DLL int XGBoosterPredictFromCudaArray(BoosterHandle handle, char const *valu
 
 /**
  * \brief Inplace prediction from CUDA dense dataframe (cuDF in Python).
+ *
+ * \note If the booster is configured to run on a CPU, XGBoost falls back to run
+ *       prediction with DMatrix with a performance warning.
  *
  * \param handle        Booster handle
  * \param values        List of __cuda_array_interface__ for all columns encoded in JSON list.
@@ -1189,7 +1268,7 @@ XGB_DLL int XGBoosterPredictFromCudaColumnar(BoosterHandle handle, char const *v
  * \brief Load model from existing file
  *
  * \param handle handle
- * \param fname File URI or file name.
+ * \param fname File URI or file name. The string must be UTF-8 encoded.
  * \return 0 when success, -1 when failure happens
  */
 XGB_DLL int XGBoosterLoadModel(BoosterHandle handle,
@@ -1198,7 +1277,7 @@ XGB_DLL int XGBoosterLoadModel(BoosterHandle handle,
  * \brief Save model into existing file
  *
  * \param handle handle
- * \param fname File URI or file name.
+ * \param fname File URI or file name. The string must be UTF-8 encoded.
  * \return 0 when success, -1 when failure happens
  */
 XGB_DLL int XGBoosterSaveModel(BoosterHandle handle,
@@ -1238,15 +1317,6 @@ XGB_DLL int XGBoosterSaveModelToBuffer(BoosterHandle handle, char const *config,
                                        char const **out_dptr);
 
 /*!
- * \brief Save booster to a buffer with in binary format.
- *
- * \deprecated since 1.6.0
- * \see XGBoosterSaveModelToBuffer()
- */
-XGB_DLL int XGBoosterGetModelRaw(BoosterHandle handle, bst_ulong *out_len,
-                                 const char **out_dptr);
-
-/*!
  * \brief Memory snapshot based serialization method.  Saves everything states
  * into buffer.
  *
@@ -1268,24 +1338,6 @@ XGB_DLL int XGBoosterSerializeToBuffer(BoosterHandle handle, bst_ulong *out_len,
  */
 XGB_DLL int XGBoosterUnserializeFromBuffer(BoosterHandle handle,
                                            const void *buf, bst_ulong len);
-
-/*!
- * \brief Initialize the booster from rabit checkpoint.
- *  This is used in distributed training API.
- * \param handle handle
- * \param version The output version of the model.
- * \return 0 when success, -1 when failure happens
- */
-XGB_DLL int XGBoosterLoadRabitCheckpoint(BoosterHandle handle,
-                                         int* version);
-
-/*!
- * \brief Save the current checkpoint to rabit.
- * \param handle handle
- * \return 0 when success, -1 when failure happens
- */
-XGB_DLL int XGBoosterSaveRabitCheckpoint(BoosterHandle handle);
-
 
 /*!
  * \brief Save XGBoost's internal configuration into a JSON document.  Currently the
@@ -1501,6 +1553,83 @@ XGB_DLL int XGBoosterFeatureScore(BoosterHandle handle, const char *config,
  * @{
  */
 
+/**
+ * @brief Handle to tracker.
+ *
+ *   There are currently two types of tracker in XGBoost, first one is `rabit`, while the
+ *   other one is `federated`.
+ *
+ *   This is still under development.
+ */
+typedef void *TrackerHandle; /* NOLINT */
+
+/**
+ * @brief Create a new tracker.
+ *
+ * @param config JSON encoded parameters.
+ *
+ *   - dmlc_communicator: String, the type of tracker to create. Available options are `rabit`
+ *                        and `federated`.
+ *   - n_workers: Integer, the number of workers.
+ *   - port: (Optional) Integer, the port this tracker should listen to.
+ *   - timeout: (Optional) Integer, timeout in seconds for various networking operations.
+ *
+ *   Some configurations are `rabit` specific:
+ *   - host: (Optional) String, Used by the the `rabit` tracker to specify the address of the host.
+ *
+ *   Some `federated` specific configurations:
+ *   - federated_secure: Boolean, whether this is a secure server.
+ *   - server_key_path: Path to the server key. Used only if this is a secure server.
+ *   - server_cert_path: Path to the server certificate. Used only if this is a secure server.
+ *   - client_cert_path: Path to the client certificate. Used only if this is a secure server.
+ *
+ * @param handle The handle to the created tracker.
+ *
+ * @return 0 for success, -1 for failure.
+ */
+XGB_DLL int XGTrackerCreate(char const *config, TrackerHandle *handle);
+
+/**
+ * @brief Get the arguments needed for running workers. This should be called after
+ *        XGTrackerRun() and XGTrackerWait()
+ *
+ * @param handle The handle to the tracker.
+ * @param args The arguments returned as a JSON document.
+ *
+ * @return 0 for success, -1 for failure.
+ */
+XGB_DLL int XGTrackerWorkerArgs(TrackerHandle handle, char const **args);
+
+/**
+ * @brief Run the tracker.
+ *
+ * @param handle The handle to the tracker.
+ *
+ * @return 0 for success, -1 for failure.
+ */
+XGB_DLL int XGTrackerRun(TrackerHandle handle);
+
+/**
+ * @brief Wait for the tracker to finish, should be called after XGTrackerRun().
+ *
+ * @param handle The handle to the tracker.
+ * @param config JSON encoded configuration. No argument is required yet, preserved for
+ *        the future.
+ *
+ * @return 0 for success, -1 for failure.
+ */
+XGB_DLL int XGTrackerWait(TrackerHandle handle, char const *config);
+
+/**
+ * @brief Free a tracker instance. XGTrackerWait() is called internally. If the tracker
+ *        cannot close properly, manual interruption is required.
+ *
+ * @param handle The handle to the tracker.
+ *
+ * @return 0 for success, -1 for failure.
+ */
+XGB_DLL int XGTrackerFree(TrackerHandle handle);
+
 /*!
  * \brief Initialize the collective communicator.
  *
@@ -1515,30 +1644,22 @@ XGB_DLL int XGBoosterFeatureScore(BoosterHandle handle, const char *config,
  * \param config JSON encoded configuration. Accepted JSON keys are:
  *   - xgboost_communicator: The type of the communicator. Can be set as an environment variable.
  *     * rabit: Use Rabit. This is the default if the type is unspecified.
- *     * mpi: Use MPI.
  *     * federated: Use the gRPC interface for Federated Learning.
  * Only applicable to the Rabit communicator (these are case-sensitive):
  *   - rabit_tracker_uri: Hostname of the tracker.
  *   - rabit_tracker_port: Port number of the tracker.
  *   - rabit_task_id: ID of the current task, can be used to obtain deterministic rank assignment.
  *   - rabit_world_size: Total number of workers.
- *   - rabit_hadoop_mode: Enable Hadoop support.
- *   - rabit_tree_reduce_minsize: Minimal size for tree reduce.
- *   - rabit_reduce_ring_mincount: Minimal count to perform ring reduce.
- *   - rabit_reduce_buffer: Size of the reduce buffer.
- *   - rabit_bootstrap_cache: Size of the bootstrap cache.
- *   - rabit_debug: Enable debugging.
  *   - rabit_timeout: Enable timeout.
  *   - rabit_timeout_sec: Timeout in seconds.
- *   - rabit_enable_tcp_no_delay: Enable TCP no delay on Unix platforms.
  * Only applicable to the Rabit communicator (these are case-sensitive, and can be set as
  * environment variables):
  *   - DMLC_TRACKER_URI: Hostname of the tracker.
  *   - DMLC_TRACKER_PORT: Port number of the tracker.
  *   - DMLC_TASK_ID: ID of the current task, can be used to obtain deterministic rank assignment.
- *   - DMLC_ROLE: Role of the current task, "worker" or "server".
- *   - DMLC_NUM_ATTEMPT: Number of attempts after task failure.
  *   - DMLC_WORKER_CONNECT_RETRY: Number of retries to connect to the tracker.
+ *   - dmlc_nccl_path: The path to NCCL shared object. Only used if XGBoost is compiled with
+ *                     `USE_DLOPEN_NCCL`.
  * Only applicable to the Federated communicator (use upper case for environment variables, use
  * lower case for runtime configuration):
  *   - federated_server_address: Address of the federated server.

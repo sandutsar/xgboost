@@ -1,4 +1,5 @@
 """Xgboost pyspark integration submodule for helper functions."""
+
 # pylint: disable=fixme
 
 import inspect
@@ -7,10 +8,10 @@ import os
 import sys
 import uuid
 from threading import Thread
-from typing import Any, Callable, Dict, Set, Type
+from typing import Any, Callable, Dict, Optional, Set, Type, Union
 
 import pyspark
-from pyspark import BarrierTaskContext, SparkContext, SparkFiles
+from pyspark import BarrierTaskContext, SparkConf, SparkContext, SparkFiles, TaskContext
 from pyspark.sql.session import SparkSession
 
 from xgboost import Booster, XGBModel, collective
@@ -97,15 +98,30 @@ def _get_spark_session() -> SparkSession:
     return SparkSession.builder.getOrCreate()
 
 
-def get_logger(name: str, level: str = "INFO") -> logging.Logger:
+def get_logger(name: str, level: Optional[Union[str, int]] = None) -> logging.Logger:
     """Gets a logger by name, or creates and configures it for the first time."""
     logger = logging.getLogger(name)
-    logger.setLevel(level)
+    if level is not None:
+        logger.setLevel(level)
+    else:
+        # Default to info if not set.
+        if logger.level == logging.NOTSET:
+            logger.setLevel(logging.INFO)
     # If the logger is configured, skip the configure
     if not logger.handlers and not logging.getLogger().handlers:
         handler = logging.StreamHandler(sys.stderr)
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(funcName)s %(message)s"
+        )
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
     return logger
+
+
+def get_logger_level(name: str) -> Optional[int]:
+    """Get the logger level for the given log name"""
+    logger = logging.getLogger(name)
+    return None if logger.level == logging.NOTSET else logger.level
 
 
 def _get_max_num_concurrent_tasks(spark_context: SparkContext) -> int:
@@ -125,7 +141,14 @@ def _is_local(spark_context: SparkContext) -> bool:
     return spark_context._jsc.sc().isLocal()
 
 
-def _get_gpu_id(task_context: BarrierTaskContext) -> int:
+def _is_standalone_or_localcluster(conf: SparkConf) -> bool:
+    master = conf.get("spark.master")
+    return master is not None and (
+        master.startswith("spark://") or master.startswith("local-cluster")
+    )
+
+
+def _get_gpu_id(task_context: TaskContext) -> int:
     """Get the gpu id from the task resources"""
     if task_context is None:
         # This is a safety check.
@@ -186,3 +209,8 @@ def deserialize_booster(model: str) -> Booster:
         f.write(model)
     booster.load_model(tmp_file_name)
     return booster
+
+
+def use_cuda(device: Optional[str]) -> bool:
+    """Whether xgboost is using CUDA workers."""
+    return device in ("cuda", "gpu")

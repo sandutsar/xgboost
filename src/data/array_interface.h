@@ -1,5 +1,5 @@
 /**
- * Copyright 2019-2023 by XGBoost Contributors
+ * Copyright 2019-2024, XGBoost Contributors
  * \file array_interface.h
  * \brief View of __array_interface__
  */
@@ -12,11 +12,11 @@
 #include <limits>  // for numeric_limits
 #include <map>
 #include <string>
-#include <type_traits>  // std::alignment_of,std::remove_pointer_t
+#include <type_traits>  // for alignment_of, remove_pointer_t, invoke_result_t
 #include <utility>
 #include <vector>
 
-#include "../common/bitfield.h"
+#include "../common/bitfield.h"  // for RBitField8
 #include "../common/common.h"
 #include "../common/error_msg.h"  // for NoF128
 #include "xgboost/base.h"
@@ -25,6 +25,10 @@
 #include "xgboost/linalg.h"
 #include "xgboost/logging.h"
 #include "xgboost/span.h"
+
+#if defined(XGBOOST_USE_CUDA)
+#include "cuda_fp16.h"
+#endif
 
 namespace xgboost {
 // Common errors in parsing columnar format.
@@ -100,7 +104,20 @@ struct ArrayInterfaceErrors {
  */
 class ArrayInterfaceHandler {
  public:
-  enum Type : std::int8_t { kF2, kF4, kF8, kF16, kI1, kI2, kI4, kI8, kU1, kU2, kU4, kU8 };
+  enum Type : std::int8_t {
+    kF2 = 0,
+    kF4 = 1,
+    kF8 = 2,
+    kF16 = 3,
+    kI1 = 4,
+    kI2 = 5,
+    kI4 = 6,
+    kI8 = 7,
+    kU1 = 8,
+    kU2 = 9,
+    kU4 = 10,
+    kU8 = 11,
+  };
 
   template <typename PtrType>
   static PtrType GetPtrFromArrayData(Object::Map const &obj) {
@@ -304,12 +321,12 @@ class ArrayInterfaceHandler {
 template <typename T, typename E = void>
 struct ToDType;
 // float
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#if defined(XGBOOST_USE_CUDA)
 template <>
 struct ToDType<__half> {
   static constexpr ArrayInterfaceHandler::Type kType = ArrayInterfaceHandler::kF2;
 };
-#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#endif  // defined(XGBOOST_USE_CUDA)
 template <>
 struct ToDType<float> {
   static constexpr ArrayInterfaceHandler::Type kType = ArrayInterfaceHandler::kF4;
@@ -358,11 +375,6 @@ struct ToDType<int64_t> {
   static constexpr ArrayInterfaceHandler::Type kType = ArrayInterfaceHandler::kI8;
 };
 
-#if !defined(XGBOOST_USE_CUDA)
-inline void ArrayInterfaceHandler::SyncCudaStream(int64_t) { common::AssertGPUSupport(); }
-inline bool ArrayInterfaceHandler::IsCudaPtr(void const *) { return false; }
-#endif  // !defined(XGBOOST_USE_CUDA)
-
 /**
  * \brief A type erased view over __array_interface__ protocol defined by numpy
  *
@@ -380,7 +392,7 @@ inline bool ArrayInterfaceHandler::IsCudaPtr(void const *) { return false; }
  *   numpy has the proper support even though it's in the __cuda_array_interface__
  *   protocol defined by numba.
  */
-template <int32_t D, bool allow_mask = (D == 1)>
+template <std::int32_t D, bool allow_mask = (D == 1)>
 class ArrayInterface {
   static_assert(D > 0, "Invalid dimension for array interface.");
 
@@ -451,7 +463,7 @@ class ArrayInterface {
 
   explicit ArrayInterface(std::string const &str) : ArrayInterface{StringView{str}} {}
 
-  explicit ArrayInterface(StringView str) : ArrayInterface<D>{Json::Load(str)} {}
+  explicit ArrayInterface(StringView str) : ArrayInterface{Json::Load(str)} {}
 
   void AssignType(StringView typestr) {
     using T = ArrayInterfaceHandler::Type;
@@ -459,11 +471,11 @@ class ArrayInterface {
       CHECK(sizeof(long double) == 16) << error::NoF128();
       type = T::kF16;
     } else if (typestr[1] == 'f' && typestr[2] == '2') {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#if defined(XGBOOST_USE_CUDA)
       type = T::kF2;
 #else
       LOG(FATAL) << "Half type is not supported.";
-#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#endif  // defined(XGBOOST_USE_CUDA)
     } else if (typestr[1] == 'f' && typestr[2] == '4') {
       type = T::kF4;
     } else if (typestr[1] == 'f' && typestr[2] == '8') {
@@ -490,20 +502,17 @@ class ArrayInterface {
     }
   }
 
-  XGBOOST_DEVICE size_t Shape(size_t i) const { return shape[i]; }
-  XGBOOST_DEVICE size_t Stride(size_t i) const { return strides[i]; }
+  [[nodiscard]] XGBOOST_DEVICE std::size_t Shape(size_t i) const { return shape[i]; }
+  [[nodiscard]] XGBOOST_DEVICE std::size_t Stride(size_t i) const { return strides[i]; }
 
   template <typename Fn>
   XGBOOST_HOST_DEV_INLINE decltype(auto) DispatchCall(Fn func) const {
     using T = ArrayInterfaceHandler::Type;
     switch (type) {
       case T::kF2: {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#if defined(XGBOOST_USE_CUDA)
         return func(reinterpret_cast<__half const *>(data));
-#else
-        SPAN_CHECK(false);
-        return func(reinterpret_cast<float const *>(data));
-#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#endif  // defined(XGBOOST_USE_CUDA)
       }
       case T::kF4:
         return func(reinterpret_cast<float const *>(data));
@@ -540,23 +549,23 @@ class ArrayInterface {
     return func(reinterpret_cast<uint64_t const *>(data));
   }
 
-  XGBOOST_DEVICE std::size_t ElementSize() const {
+  [[nodiscard]] XGBOOST_DEVICE std::size_t ElementSize() const {
     return this->DispatchCall([](auto *typed_data_ptr) {
       return sizeof(std::remove_pointer_t<decltype(typed_data_ptr)>);
     });
   }
-  XGBOOST_DEVICE std::size_t ElementAlignment() const {
+  [[nodiscard]] XGBOOST_DEVICE std::size_t ElementAlignment() const {
     return this->DispatchCall([](auto *typed_data_ptr) {
       return std::alignment_of<std::remove_pointer_t<decltype(typed_data_ptr)>>::value;
     });
   }
 
   template <typename T = float, typename... Index>
-  XGBOOST_DEVICE T operator()(Index &&...index) const {
+  XGBOOST_HOST_DEV_INLINE T operator()(Index &&...index) const {
     static_assert(sizeof...(index) <= D, "Invalid index.");
     return this->DispatchCall([=](auto const *p_values) -> T {
       std::size_t offset = linalg::detail::Offset<0ul>(strides, 0ul, index...);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#if defined(XGBOOST_USE_CUDA)
       // No operator defined for half -> size_t
       using Type = std::conditional_t<
           std::is_same<__half,
@@ -566,7 +575,7 @@ class ArrayInterface {
       return static_cast<T>(static_cast<Type>(p_values[offset]));
 #else
       return static_cast<T>(p_values[offset]);
-#endif
+#endif  // defined(XGBOOST_USE_CUDA)
     });
   }
 
@@ -586,10 +595,61 @@ class ArrayInterface {
   ArrayInterfaceHandler::Type type{ArrayInterfaceHandler::kF16};
 };
 
+template <typename Fn>
+auto DispatchDType(ArrayInterfaceHandler::Type dtype, Fn dispatch) {
+  switch (dtype) {
+    case ArrayInterfaceHandler::kF2: {
+#if defined(XGBOOST_USE_CUDA)
+      return dispatch(__half{});
+#else
+      LOG(FATAL) << "half type is only supported for CUDA input.";
+      break;
+#endif
+    }
+    case ArrayInterfaceHandler::kF4: {
+      return dispatch(float{});
+    }
+    case ArrayInterfaceHandler::kF8: {
+      return dispatch(double{});
+    }
+    case ArrayInterfaceHandler::kF16: {
+      using T = long double;
+      CHECK(sizeof(T) == 16) << error::NoF128();
+      return dispatch(T{});
+    }
+    case ArrayInterfaceHandler::kI1: {
+      return dispatch(std::int8_t{});
+    }
+    case ArrayInterfaceHandler::kI2: {
+      return dispatch(std::int16_t{});
+    }
+    case ArrayInterfaceHandler::kI4: {
+      return dispatch(std::int32_t{});
+    }
+    case ArrayInterfaceHandler::kI8: {
+      return dispatch(std::int64_t{});
+    }
+    case ArrayInterfaceHandler::kU1: {
+      return dispatch(std::uint8_t{});
+    }
+    case ArrayInterfaceHandler::kU2: {
+      return dispatch(std::uint16_t{});
+    }
+    case ArrayInterfaceHandler::kU4: {
+      return dispatch(std::uint32_t{});
+    }
+    case ArrayInterfaceHandler::kU8: {
+      return dispatch(std::uint64_t{});
+    }
+  }
+
+  return std::invoke_result_t<Fn, std::int8_t>();
+}
+
 template <std::int32_t D, typename Fn>
-void DispatchDType(ArrayInterface<D> const array, std::int32_t device, Fn fn) {
+void DispatchDType(ArrayInterface<D> const array, DeviceOrd device, Fn fn) {
   // Only used for cuDF at the moment.
-  CHECK_EQ(array.valid.Size(), 0);
+  CHECK_EQ(array.valid.Capacity(), 0);
   auto dispatch = [&](auto t) {
     using T = std::remove_const_t<decltype(t)> const;
     // Set the data size to max as we don't know the original size of a sliced array:
@@ -601,60 +661,7 @@ void DispatchDType(ArrayInterface<D> const array, std::int32_t device, Fn fn) {
                                                       std::numeric_limits<std::size_t>::max()},
                                 array.shape, array.strides, device});
   };
-  switch (array.type) {
-    case ArrayInterfaceHandler::kF2: {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
-      dispatch(__half{});
-#endif
-      break;
-    }
-    case ArrayInterfaceHandler::kF4: {
-      dispatch(float{});
-      break;
-    }
-    case ArrayInterfaceHandler::kF8: {
-      dispatch(double{});
-      break;
-    }
-    case ArrayInterfaceHandler::kF16: {
-      using T = long double;
-      CHECK(sizeof(long double) == 16) << error::NoF128();
-      dispatch(T{});
-      break;
-    }
-    case ArrayInterfaceHandler::kI1: {
-      dispatch(std::int8_t{});
-      break;
-    }
-    case ArrayInterfaceHandler::kI2: {
-      dispatch(std::int16_t{});
-      break;
-    }
-    case ArrayInterfaceHandler::kI4: {
-      dispatch(std::int32_t{});
-      break;
-    }
-    case ArrayInterfaceHandler::kI8: {
-      dispatch(std::int64_t{});
-      break;
-    }
-    case ArrayInterfaceHandler::kU1: {
-      dispatch(std::uint8_t{});
-      break;
-    }
-    case ArrayInterfaceHandler::kU2: {
-      dispatch(std::uint16_t{});
-      break;
-    }
-    case ArrayInterfaceHandler::kU4: {
-      dispatch(std::uint32_t{});
-      break;
-    }
-    case ArrayInterfaceHandler::kU8: {
-      dispatch(std::uint64_t{});
-      break;
-    }
-  }
+  DispatchDType(array.type, dispatch);
 }
 
 /**

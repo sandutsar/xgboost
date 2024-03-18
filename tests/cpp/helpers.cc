@@ -1,5 +1,5 @@
 /**
- * Copyright 2016-2023 by XGBoost contributors
+ * Copyright 2016-2024 by XGBoost contributors
  */
 #include "helpers.h"
 
@@ -96,9 +96,9 @@ void CheckObjFunctionImpl(std::unique_ptr<xgboost::ObjFunction> const& obj,
                           std::vector<xgboost::bst_float> out_grad,
                           std::vector<xgboost::bst_float> out_hess) {
   xgboost::HostDeviceVector<xgboost::bst_float> in_preds(preds);
-  xgboost::HostDeviceVector<xgboost::GradientPair> out_gpair;
-  obj->GetGradient(in_preds, info, 1, &out_gpair);
-  std::vector<xgboost::GradientPair>& gpair = out_gpair.HostVector();
+  xgboost::linalg::Matrix<xgboost::GradientPair> out_gpair;
+  obj->GetGradient(in_preds, info, 0, &out_gpair);
+  std::vector<xgboost::GradientPair>& gpair = out_gpair.Data()->HostVector();
 
   ASSERT_EQ(gpair.size(), in_preds.Size());
   for (int i = 0; i < static_cast<int>(gpair.size()); ++i) {
@@ -119,8 +119,10 @@ void CheckObjFunction(std::unique_ptr<xgboost::ObjFunction> const& obj,
                       std::vector<xgboost::bst_float> out_hess) {
   xgboost::MetaInfo info;
   info.num_row_ = labels.size();
-  info.labels =
-      xgboost::linalg::Tensor<float, 2>{labels.cbegin(), labels.cend(), {labels.size()}, -1};
+  info.labels = xgboost::linalg::Tensor<float, 2>{labels.cbegin(),
+                                                  labels.cend(),
+                                                  {labels.size(), static_cast<std::size_t>(1)},
+                                                  xgboost::DeviceOrd::CPU()};
   info.weights_.HostVector() = weights;
 
   CheckObjFunctionImpl(obj, preds, labels, weights, info, out_grad, out_hess);
@@ -155,8 +157,10 @@ void CheckRankingObjFunction(std::unique_ptr<xgboost::ObjFunction> const& obj,
                              std::vector<xgboost::bst_float> out_hess) {
   xgboost::MetaInfo info;
   info.num_row_ = labels.size();
-  info.labels = xgboost::linalg::Tensor<float, 2>{
-      labels.cbegin(), labels.cend(), {labels.size(), static_cast<size_t>(1)}, -1};
+  info.labels = xgboost::linalg::Matrix<float>{labels.cbegin(),
+                                               labels.cend(),
+                                               {labels.size(), static_cast<std::size_t>(1)},
+                                               xgboost::DeviceOrd::CPU()};
   info.weights_.HostVector() = weights;
   info.group_ptr_ = groups;
 
@@ -171,8 +175,9 @@ xgboost::bst_float GetMetricEval(xgboost::Metric* metric,
                                  xgboost::DataSplitMode data_split_mode) {
   return GetMultiMetricEval(
       metric, preds,
-      xgboost::linalg::Tensor<float, 2>{labels.begin(), labels.end(), {labels.size()}, -1}, weights,
-      groups, data_split_mode);
+      xgboost::linalg::Tensor<float, 2>{
+          labels.begin(), labels.end(), {labels.size()}, xgboost::DeviceOrd::CPU()},
+      weights, groups, data_split_mode);
 }
 
 double GetMultiMetricEval(xgboost::Metric* metric,
@@ -210,6 +215,16 @@ SimpleLCG::StateType SimpleLCG::Max() const { return max(); }
 // Make sure it's compile time constant.
 static_assert(SimpleLCG::max() - SimpleLCG::min());
 
+void RandomDataGenerator::GenerateLabels(std::shared_ptr<DMatrix> p_fmat) const {
+  RandomDataGenerator{static_cast<bst_idx_t>(p_fmat->Info().num_row_), this->n_targets_, 0.0f}.GenerateDense(
+      p_fmat->Info().labels.Data());
+  CHECK_EQ(p_fmat->Info().labels.Size(), this->rows_ * this->n_targets_);
+  p_fmat->Info().labels.Reshape(this->rows_, this->n_targets_);
+  if (device_.IsCUDA()) {
+    p_fmat->Info().labels.SetDevice(device_);
+  }
+}
+
 void RandomDataGenerator::GenerateDense(HostDeviceVector<float> *out) const {
   xgboost::SimpleRealUniformDistribution<bst_float> dist(lower_, upper_);
   CHECK(out);
@@ -226,7 +241,7 @@ void RandomDataGenerator::GenerateDense(HostDeviceVector<float> *out) const {
       v = dist(&lcg);
     }
   }
-  if (device_ >= 0) {
+  if (device_.IsCUDA()) {
     out->SetDevice(device_);
     out->DeviceSpan();
   }
@@ -248,7 +263,7 @@ std::string RandomDataGenerator::GenerateArrayInterface(
 
 std::pair<std::vector<std::string>, std::string> MakeArrayInterfaceBatch(
     HostDeviceVector<float> const* storage, std::size_t n_samples, bst_feature_t n_features,
-    std::size_t batches, std::int32_t device) {
+    std::size_t batches, DeviceOrd device) {
   std::vector<std::string> result(batches);
   std::vector<Json> objects;
 
@@ -257,7 +272,7 @@ std::pair<std::vector<std::string>, std::string> MakeArrayInterfaceBatch(
   auto make_interface = [storage, device, n_features](std::size_t offset, std::size_t rows) {
     Json array_interface{Object()};
     array_interface["data"] = std::vector<Json>(2);
-    if (device >= 0) {
+    if (device.IsCUDA()) {
       array_interface["data"][0] =
           Integer(reinterpret_cast<int64_t>(storage->DevicePointer() + offset));
       array_interface["stream"] = Null{};
@@ -319,7 +334,7 @@ std::string RandomDataGenerator::GenerateColumnarArrayInterface(
 }
 
 void RandomDataGenerator::GenerateCSR(
-    HostDeviceVector<float>* value, HostDeviceVector<bst_row_t>* row_ptr,
+    HostDeviceVector<float>* value, HostDeviceVector<std::size_t>* row_ptr,
     HostDeviceVector<bst_feature_t>* columns) const {
   auto& h_value = value->HostVector();
   auto& h_rptr = row_ptr->HostVector();
@@ -349,7 +364,7 @@ void RandomDataGenerator::GenerateCSR(
     h_rptr.emplace_back(rptr);
   }
 
-  if (device_ >= 0) {
+  if (device_.IsCUDA()) {
     value->SetDevice(device_);
     value->DeviceSpan();
     row_ptr->SetDevice(device_);
@@ -363,16 +378,16 @@ void RandomDataGenerator::GenerateCSR(
   CHECK_EQ(columns->Size(), value->Size());
 }
 
-std::shared_ptr<DMatrix> RandomDataGenerator::GenerateDMatrix(bool with_label, bool float_label,
-                                                              size_t classes) const {
+[[nodiscard]] std::shared_ptr<DMatrix> RandomDataGenerator::GenerateDMatrix(
+    bool with_label, bool float_label, size_t classes, DataSplitMode data_split_mode) const {
   HostDeviceVector<float> data;
-  HostDeviceVector<bst_row_t> rptrs;
+  HostDeviceVector<std::size_t> rptrs;
   HostDeviceVector<bst_feature_t> columns;
   this->GenerateCSR(&data, &rptrs, &columns);
   data::CSRAdapter adapter(rptrs.HostPointer(), columns.HostPointer(), data.HostPointer(), rows_,
                            data.Size(), cols_);
   std::shared_ptr<DMatrix> out{
-      DMatrix::Create(&adapter, std::numeric_limits<float>::quiet_NaN(), 1)};
+      DMatrix::Create(&adapter, std::numeric_limits<float>::quiet_NaN(), 1, "", data_split_mode)};
 
   if (with_label) {
     RandomDataGenerator gen{rows_, n_targets_, 0.0f};
@@ -389,12 +404,15 @@ std::shared_ptr<DMatrix> RandomDataGenerator::GenerateDMatrix(bool with_label, b
       out->Info().labels.Reshape(this->rows_, this->n_targets_);
     }
   }
-  if (device_ >= 0) {
+  if (device_.IsCUDA()) {
     out->Info().labels.SetDevice(device_);
     out->Info().feature_types.SetDevice(device_);
     for (auto const& page : out->GetBatches<SparsePage>()) {
       page.data.SetDevice(device_);
       page.offset.SetDevice(device_);
+      // pull to device
+      page.data.ConstDeviceSpan();
+      page.offset.ConstDeviceSpan();
     }
   }
   if (!ft_.empty()) {
@@ -403,17 +421,77 @@ std::shared_ptr<DMatrix> RandomDataGenerator::GenerateDMatrix(bool with_label, b
   return out;
 }
 
-std::shared_ptr<DMatrix> RandomDataGenerator::GenerateQuantileDMatrix() {
+[[nodiscard]] std::shared_ptr<DMatrix> RandomDataGenerator::GenerateSparsePageDMatrix(
+    std::string prefix, bool with_label) const {
+  CHECK_GE(this->rows_, this->n_batches_);
+  CHECK_GE(this->n_batches_, 1)
+      << "Must set the n_batches before generating an external memory DMatrix.";
+  std::unique_ptr<ArrayIterForTest> iter;
+  if (device_.IsCPU()) {
+    iter = std::make_unique<NumpyArrayIterForTest>(this->sparsity_, rows_, cols_, n_batches_);
+  } else {
+#if defined(XGBOOST_USE_CUDA)
+    iter = std::make_unique<CudaArrayIterForTest>(this->sparsity_, rows_, cols_, n_batches_);
+#else
+    CHECK(iter);
+#endif  // defined(XGBOOST_USE_CUDA)
+  }
+
+  std::unique_ptr<DMatrix> dmat{
+      DMatrix::Create(static_cast<DataIterHandle>(iter.get()), iter->Proxy(), Reset, Next,
+                      std::numeric_limits<float>::quiet_NaN(), Context{}.Threads(), prefix)};
+
+  auto row_page_path =
+      data::MakeId(prefix, dynamic_cast<data::SparsePageDMatrix*>(dmat.get())) + ".row.page";
+  EXPECT_TRUE(FileExists(row_page_path)) << row_page_path;
+
+  // Loop over the batches and count the number of pages
+  std::size_t batch_count = 0;
+  bst_idx_t row_count = 0;
+  for (const auto& batch : dmat->GetBatches<xgboost::SparsePage>()) {
+    batch_count++;
+    row_count += batch.Size();
+    CHECK_NE(batch.data.Size(), 0);
+  }
+
+  EXPECT_EQ(batch_count, n_batches_);
+  EXPECT_EQ(row_count, dmat->Info().num_row_);
+
+  if (with_label) {
+    RandomDataGenerator{static_cast<bst_idx_t>(dmat->Info().num_row_), this->n_targets_, 0.0f}.GenerateDense(
+        dmat->Info().labels.Data());
+    CHECK_EQ(dmat->Info().labels.Size(), this->rows_ * this->n_targets_);
+    dmat->Info().labels.Reshape(this->rows_, this->n_targets_);
+  }
+  return dmat;
+}
+
+std::shared_ptr<DMatrix> RandomDataGenerator::GenerateQuantileDMatrix(bool with_label) {
   NumpyArrayIterForTest iter{this->sparsity_, this->rows_, this->cols_, 1};
   auto m = std::make_shared<data::IterativeDMatrix>(
       &iter, iter.Proxy(), nullptr, Reset, Next, std::numeric_limits<float>::quiet_NaN(), 0, bins_);
+  if (with_label) {
+    this->GenerateLabels(m);
+  }
   return m;
 }
 
-NumpyArrayIterForTest::NumpyArrayIterForTest(float sparsity, size_t rows, size_t cols,
+#if !defined(XGBOOST_USE_CUDA)
+CudaArrayIterForTest::CudaArrayIterForTest(float sparsity, size_t rows, size_t cols, size_t batches)
+    : ArrayIterForTest{sparsity, rows, cols, batches} {
+  common::AssertGPUSupport();
+}
+
+int CudaArrayIterForTest::Next() {
+  common::AssertGPUSupport();
+  return 0;
+}
+#endif  // !defined(XGBOOST_USE_CUDA)
+
+NumpyArrayIterForTest::NumpyArrayIterForTest(float sparsity, bst_idx_t rows, size_t cols,
                                              size_t batches)
     : ArrayIterForTest{sparsity, rows, cols, batches} {
-  rng_->Device(Context::kCpuId);
+  rng_->Device(DeviceOrd::CPU());
   std::tie(batches_, interface_) = rng_->GenerateArrayInterfaceBatch(&data_, n_batches_);
   this->Reset();
 }
@@ -437,7 +515,7 @@ std::shared_ptr<DMatrix> GetDMatrixFromData(const std::vector<float>& x, std::si
   return p_fmat;
 }
 
-std::unique_ptr<DMatrix> CreateSparsePageDMatrix(bst_row_t n_samples, bst_feature_t n_features,
+std::unique_ptr<DMatrix> CreateSparsePageDMatrix(bst_idx_t n_samples, bst_feature_t n_features,
                                                  size_t n_batches, std::string prefix) {
   CHECK_GE(n_samples, n_batches);
   NumpyArrayIterForTest iter(0, n_samples, n_features, n_batches);
@@ -570,12 +648,11 @@ std::unique_ptr<GradientBooster> CreateTrainedGBM(std::string name, Args kwargs,
     labels[i] = i;
   }
   p_dmat->Info().labels =
-      linalg::Tensor<float, 2>{labels.cbegin(), labels.cend(), {labels.size()}, -1};
-  HostDeviceVector<GradientPair> gpair;
-  auto& h_gpair = gpair.HostVector();
-  h_gpair.resize(kRows);
+      linalg::Tensor<float, 2>{labels.cbegin(), labels.cend(), {labels.size()}, DeviceOrd::CPU()};
+  linalg::Matrix<GradientPair> gpair({kRows}, ctx->Device());
+  auto h_gpair = gpair.HostView();
   for (size_t i = 0; i < kRows; ++i) {
-    h_gpair[i] = GradientPair{static_cast<float>(i), 1};
+    h_gpair(i) = GradientPair{static_cast<float>(i), 1};
   }
 
   PredictionCacheEntry predts;
@@ -585,10 +662,10 @@ std::unique_ptr<GradientBooster> CreateTrainedGBM(std::string name, Args kwargs,
   return gbm;
 }
 
-ArrayIterForTest::ArrayIterForTest(float sparsity, size_t rows, size_t cols, size_t batches)
+ArrayIterForTest::ArrayIterForTest(float sparsity, bst_idx_t rows, size_t cols, size_t batches)
     : rows_{rows}, cols_{cols}, n_batches_{batches} {
   XGProxyDMatrixCreate(&proxy_);
-  rng_.reset(new RandomDataGenerator{rows_, cols_, sparsity});
+  rng_ = std::make_unique<RandomDataGenerator>(rows_, cols_, sparsity);
   std::tie(batches_, interface_) = rng_->GenerateArrayInterfaceBatch(&data_, n_batches_);
 }
 
@@ -601,7 +678,7 @@ ArrayIterForTest::ArrayIterForTest(Context const* ctx, HostDeviceVector<float> c
   CHECK_EQ(this->data_.Size(), rows_ * cols_ * n_batches);
   this->data_.Copy(data);
   std::tie(batches_, interface_) =
-      MakeArrayInterfaceBatch(&data_, rows_, cols_, n_batches_, ctx->gpu_id);
+      MakeArrayInterfaceBatch(&data_, rows_, cols_, n_batches_, ctx->Device());
 }
 
 ArrayIterForTest::~ArrayIterForTest() { XGDMatrixFree(proxy_); }

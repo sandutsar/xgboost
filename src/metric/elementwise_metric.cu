@@ -1,5 +1,5 @@
 /**
- * Copyright 2015-2023 by XGBoost Contributors
+ * Copyright 2015-2024, XGBoost Contributors
  * \file elementwise_metric.cu
  * \brief evaluation metrics for elementwise binary or regression.
  * \author Kailong Chen, Tianqi Chen
@@ -12,13 +12,14 @@
 #include <cmath>
 
 #include "../collective/communicator-inl.h"
-#include "../common/common.h"           // MetricNoCache
+#include "../common/common.h"  // MetricNoCache
 #include "../common/math.h"
 #include "../common/optional_weight.h"  // OptionalWeights
 #include "../common/pseudo_huber.h"
 #include "../common/quantile_loss_utils.h"  // QuantileLossParam
 #include "../common/threading_utils.h"
 #include "metric_common.h"
+#include "xgboost/collective/result.h"  // for SafeColl
 #include "xgboost/metric.h"
 
 #if defined(XGBOOST_USE_CUDA)
@@ -30,8 +31,7 @@
 #include "../common/device_helpers.cuh"
 #endif  // XGBOOST_USE_CUDA
 
-namespace xgboost {
-namespace metric {
+namespace xgboost::metric {
 // tag the this file, used by force static link later.
 DMLC_REGISTRY_FILE_TAG(elementwise_metric);
 
@@ -45,8 +45,27 @@ namespace {
 template <typename Fn>
 PackedReduceResult Reduce(Context const* ctx, MetaInfo const& info, Fn&& loss) {
   PackedReduceResult result;
-  auto labels = info.labels.View(ctx->gpu_id);
-  if (ctx->IsCPU()) {
+  auto labels = info.labels.View(ctx->Device());
+  if (ctx->IsCUDA()) {
+#if defined(XGBOOST_USE_CUDA)
+    dh::XGBCachingDeviceAllocator<char> alloc;
+    thrust::counting_iterator<size_t> begin(0);
+    thrust::counting_iterator<size_t> end = begin + labels.Size();
+    result = thrust::transform_reduce(
+        thrust::cuda::par(alloc), begin, end,
+        [=] XGBOOST_DEVICE(size_t i) {
+          auto idx = linalg::UnravelIndex(i, labels.Shape());
+          auto sample_id = std::get<0>(idx);
+          auto target_id = std::get<1>(idx);
+          auto res = loss(i, sample_id, target_id);
+          float v{std::get<0>(res)}, wt{std::get<1>(res)};
+          return PackedReduceResult{v, wt};
+        },
+        PackedReduceResult{}, thrust::plus<PackedReduceResult>());
+#else
+    common::AssertGPUSupport();
+#endif  //  defined(XGBOOST_USE_CUDA)
+  } else {
     auto n_threads = ctx->Threads();
     std::vector<double> score_tloc(n_threads, 0.0);
     std::vector<double> weight_tloc(n_threads, 0.0);
@@ -69,25 +88,6 @@ PackedReduceResult Reduce(Context const* ctx, MetaInfo const& info, Fn&& loss) {
     double residue_sum = std::accumulate(score_tloc.cbegin(), score_tloc.cend(), 0.0);
     double weights_sum = std::accumulate(weight_tloc.cbegin(), weight_tloc.cend(), 0.0);
     result = PackedReduceResult{residue_sum, weights_sum};
-  } else {
-#if defined(XGBOOST_USE_CUDA)
-    dh::XGBCachingDeviceAllocator<char> alloc;
-    thrust::counting_iterator<size_t> begin(0);
-    thrust::counting_iterator<size_t> end = begin + labels.Size();
-    result = thrust::transform_reduce(
-        thrust::cuda::par(alloc), begin, end,
-        [=] XGBOOST_DEVICE(size_t i) {
-          auto idx = linalg::UnravelIndex(i, labels.Shape());
-          auto sample_id = std::get<0>(idx);
-          auto target_id = std::get<1>(idx);
-          auto res = loss(i, sample_id, target_id);
-          float v{std::get<0>(res)}, wt{std::get<1>(res)};
-          return PackedReduceResult{v, wt};
-        },
-        PackedReduceResult{}, thrust::plus<PackedReduceResult>());
-#else
-    common::AssertGPUSupport();
-#endif  //  defined(XGBOOST_USE_CUDA)
   }
   return result;
 }
@@ -183,12 +183,12 @@ class PseudoErrorLoss : public MetricNoCache {
 
   double Eval(const HostDeviceVector<bst_float>& preds, const MetaInfo& info) override {
     CHECK_EQ(info.labels.Shape(0), info.num_row_);
-    auto labels = info.labels.View(ctx_->gpu_id);
-    preds.SetDevice(ctx_->gpu_id);
-    auto predts = ctx_->IsCPU() ? preds.ConstHostSpan() : preds.ConstDeviceSpan();
-    info.weights_.SetDevice(ctx_->gpu_id);
-    common::OptionalWeights weights(ctx_->IsCPU() ? info.weights_.ConstHostSpan()
-                                                     : info.weights_.ConstDeviceSpan());
+    auto labels = info.labels.View(ctx_->Device());
+    preds.SetDevice(ctx_->Device());
+    auto predts = ctx_->IsCUDA() ? preds.ConstDeviceSpan() : preds.ConstHostSpan();
+    info.weights_.SetDevice(ctx_->Device());
+    common::OptionalWeights weights(ctx_->IsCUDA() ? info.weights_.ConstDeviceSpan()
+                                                   : info.weights_.ConstHostSpan());
     float slope = this->param_.huber_slope;
     CHECK_NE(slope, 0.0) << "slope for pseudo huber cannot be 0.";
     PackedReduceResult result =
@@ -199,7 +199,8 @@ class PseudoErrorLoss : public MetricNoCache {
           return std::make_tuple(v, wt);
         });
     std::array<double, 2> dat{result.Residue(), result.Weights()};
-    collective::GlobalSum(info, &dat);
+    auto rc = collective::GlobalSum(ctx_, info, linalg::MakeVec(dat.data(), dat.size()));
+    collective::SafeColl(rc);
     return EvalRowMAPE::GetFinal(dat[0], dat[1]);
   }
 };
@@ -215,7 +216,7 @@ struct EvalError {
       has_param_ = false;
     }
   }
-  const char *Name() const {
+  [[nodiscard]] const char *Name() const {
     static thread_local std::string name;
     if (has_param_) {
       std::ostringstream os;
@@ -228,7 +229,7 @@ struct EvalError {
     }
   }
 
-  XGBOOST_DEVICE bst_float EvalRow(bst_float label, bst_float pred) const {
+  [[nodiscard]] XGBOOST_DEVICE bst_float EvalRow(bst_float label, bst_float pred) const {
     // assume label is in [0,1]
     return pred > threshold_ ? 1.0f - label : label;
   }
@@ -243,11 +244,11 @@ struct EvalError {
 };
 
 struct EvalPoissonNegLogLik {
-  const char *Name() const {
+  [[nodiscard]] const char *Name() const {
     return "poisson-nloglik";
   }
 
-  XGBOOST_DEVICE bst_float EvalRow(bst_float y, bst_float py) const {
+  [[nodiscard]] XGBOOST_DEVICE bst_float EvalRow(bst_float y, bst_float py) const {
     const bst_float eps = 1e-16f;
     if (py < eps) py = eps;
     return common::LogGamma(y + 1.0f) + py - std::log(py) * y;
@@ -266,9 +267,9 @@ struct EvalPoissonNegLogLik {
  *   predt >= 0
  */
 struct EvalGammaDeviance {
-  const char *Name() const { return "gamma-deviance"; }
+  [[nodiscard]] const char *Name() const { return "gamma-deviance"; }
 
-  XGBOOST_DEVICE bst_float EvalRow(bst_float label, bst_float predt) const {
+  [[nodiscard]] XGBOOST_DEVICE bst_float EvalRow(bst_float label, bst_float predt) const {
     predt += kRtEps;
     label += kRtEps;
     return std::log(predt / label) + label / predt - 1;
@@ -287,7 +288,7 @@ struct EvalGammaNLogLik {
     return "gamma-nloglik";
   }
 
-  XGBOOST_DEVICE bst_float EvalRow(bst_float y, bst_float py) const {
+  [[nodiscard]] XGBOOST_DEVICE bst_float EvalRow(bst_float y, bst_float py) const {
     py = std::max(py, 1e-6f);
     // hardcoded dispersion.
     float constexpr kPsi = 1.0;
@@ -313,7 +314,7 @@ struct EvalTweedieNLogLik {
     CHECK(rho_ < 2 && rho_ >= 1)
         << "tweedie variance power must be in interval [1, 2)";
   }
-  const char *Name() const {
+  [[nodiscard]] const char *Name() const {
     static thread_local std::string name;
     std::ostringstream os;
     os << "tweedie-nloglik@" << rho_;
@@ -321,7 +322,7 @@ struct EvalTweedieNLogLik {
     return name.c_str();
   }
 
-  XGBOOST_DEVICE bst_float EvalRow(bst_float y, bst_float p) const {
+  [[nodiscard]] XGBOOST_DEVICE bst_float EvalRow(bst_float y, bst_float p) const {
     bst_float a = y * std::exp((1 - rho_) * std::log(p)) / (1 - rho_);
     bst_float b = std::exp((2 - rho_) * std::log(p)) / (2 - rho_);
     return -a + b;
@@ -349,12 +350,12 @@ struct EvalEWiseBase : public MetricNoCache {
     if (info.labels.Size() != 0) {
       CHECK_NE(info.labels.Shape(1), 0);
     }
-    auto labels = info.labels.View(ctx_->gpu_id);
-    info.weights_.SetDevice(ctx_->gpu_id);
-    common::OptionalWeights weights(ctx_->IsCPU() ? info.weights_.ConstHostSpan()
-                                                     : info.weights_.ConstDeviceSpan());
-    preds.SetDevice(ctx_->gpu_id);
-    auto predts = ctx_->IsCPU() ? preds.ConstHostSpan() : preds.ConstDeviceSpan();
+    auto labels = info.labels.View(ctx_->Device());
+    info.weights_.SetDevice(ctx_->Device());
+    common::OptionalWeights weights(ctx_->IsCUDA() ? info.weights_.ConstDeviceSpan()
+                                                   : info.weights_.ConstHostSpan());
+    preds.SetDevice(ctx_->Device());
+    auto predts = ctx_->IsCUDA() ? preds.ConstDeviceSpan() : preds.ConstHostSpan();
 
     auto d_policy = policy_;
     auto result =
@@ -366,11 +367,12 @@ struct EvalEWiseBase : public MetricNoCache {
         });
 
     std::array<double, 2> dat{result.Residue(), result.Weights()};
-    collective::GlobalSum(info, &dat);
+    auto rc = collective::GlobalSum(ctx_, info, linalg::MakeVec(dat.data(), dat.size()));
+    collective::SafeColl(rc);
     return Policy::GetFinal(dat[0], dat[1]);
   }
 
-  const char* Name() const override { return policy_.Name(); }
+  [[nodiscard]] const char* Name() const override { return policy_.Name(); }
 
  private:
   Policy policy_;
@@ -438,22 +440,23 @@ class QuantileError : public MetricNoCache {
     if (info.num_row_ == 0) {
       // empty DMatrix on distributed env
       std::array<double, 2> dat{0.0, 0.0};
-      collective::GlobalSum(info, &dat);
+      auto rc = collective::GlobalSum(ctx_, info, linalg::MakeVec(dat.data(), dat.size()));
+      collective::SafeColl(rc);
       CHECK_GT(dat[1], 0);
       return dat[0] / dat[1];
     }
 
     auto const* ctx = ctx_;
-    auto y_true = info.labels.View(ctx->gpu_id);
-    preds.SetDevice(ctx->gpu_id);
-    alpha_.SetDevice(ctx->gpu_id);
+    auto y_true = info.labels.View(ctx->Device());
+    preds.SetDevice(ctx->Device());
+    alpha_.SetDevice(ctx->Device());
     auto alpha = ctx->IsCPU() ? alpha_.ConstHostSpan() : alpha_.ConstDeviceSpan();
     std::size_t n_targets = preds.Size() / info.num_row_ / alpha_.Size();
     CHECK_NE(n_targets, 0);
     auto y_predt = linalg::MakeTensorView(ctx, &preds, static_cast<std::size_t>(info.num_row_),
                                           alpha_.Size(), n_targets);
 
-    info.weights_.SetDevice(ctx->gpu_id);
+    info.weights_.SetDevice(ctx->Device());
     common::OptionalWeights weight{ctx->IsCPU() ? info.weights_.ConstHostSpan()
                                                 : info.weights_.ConstDeviceSpan()};
 
@@ -476,16 +479,21 @@ class QuantileError : public MetricNoCache {
           return std::make_tuple(l, w);
         });
     std::array<double, 2> dat{result.Residue(), result.Weights()};
-    collective::GlobalSum(info, &dat);
+    auto rc = collective::GlobalSum(ctx, info, linalg::MakeVec(dat.data(), dat.size()));
+    collective::SafeColl(rc);
     CHECK_GT(dat[1], 0);
     return dat[0] / dat[1];
   }
 
   const char* Name() const override { return "quantile"; }
   void LoadConfig(Json const& in) override {
-    auto const& name = get<String const>(in["name"]);
-    CHECK_EQ(name, "quantile");
-    FromJson(in["quantile_loss_param"], &param_);
+    auto const& obj = get<Object const>(in);
+    auto it = obj.find("quantile_loss_param");
+    if (it != obj.cend()) {
+      FromJson(it->second, &param_);
+      auto const& name = get<String const>(in["name"]);
+      CHECK_EQ(name, "quantile");
+    }
   }
   void SaveConfig(Json* p_out) const override {
     auto& out = *p_out;
@@ -497,5 +505,4 @@ class QuantileError : public MetricNoCache {
 XGBOOST_REGISTER_METRIC(QuantileError, "quantile")
     .describe("Quantile regression error.")
     .set_body([](const char*) { return new QuantileError{}; });
-}  // namespace metric
-}  // namespace xgboost
+}  // namespace xgboost::metric

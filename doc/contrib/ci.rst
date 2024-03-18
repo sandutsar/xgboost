@@ -32,7 +32,7 @@ GitHub Actions is also used to build Python wheels targeting MacOS Intel and App
 ``python_wheels`` pipeline sets up environment variables prefixed ``CIBW_*`` to indicate the target
 OS and processor. The pipeline then invokes the script ``build_python_wheels.sh``, which in turns
 calls ``cibuildwheel`` to build the wheel. The ``cibuildwheel`` is a library that sets up a
-suitable Python environment for each OS and processor target. Since we don't have Apple Silion
+suitable Python environment for each OS and processor target. Since we don't have Apple Silicon
 machine in GitHub Actions, cross-compilation is needed; ``cibuildwheel`` takes care of the complex
 task of cross-compiling a Python wheel. (Note that ``cibuildwheel`` will call
 ``pip wheel``. Since XGBoost has a native library component, we created a customized build
@@ -59,7 +59,7 @@ For your convenience, we provide the wrapper script ``tests/ci_build/ci_build.sh
 
 .. code-block:: bash
 
-  tests/ci_build/ci_build.sh <CONTAINER_TYPE> <DOCKER_BINARY> --build-arg <BUILD_ARG> \
+  tests/ci_build/ci_build.sh <CONTAINER_TYPE> --use-gpus --build-arg <BUILD_ARG> \
     <COMMAND> ...
 
 where:
@@ -68,8 +68,7 @@ where:
   container definition (Dockerfile) located at ``tests/ci_build/Dockerfile.<CONTAINER_TYPE>``.
   For example, setting the container type to ``gpu`` will cause the script to load the Dockerfile
   ``tests/ci_build/Dockerfile.gpu``.
-* ``<DOCKER_BINARY>`` must be either ``docker`` or ``nvidia-docker``. Choose ``nvidia-docker``
-  as long as you need to run any GPU code.
+* Specify ``--use-gpus`` to run any GPU code. This flag will grant the container access to all NVIDIA GPUs in the base machine. Omit the flag if the access to GPUs is not necessary.
 * ``<BUILD_ARG>`` is a build argument to be passed to Docker. Must be of form ``VAR=VALUE``.
   Example: ``--build-arg CUDA_VERSION_ARG=11.0``. You can pass multiple ``--build-arg``.
 * ``<COMMAND>`` is the command to run inside the Docker container. This can be more than one argument.
@@ -83,7 +82,7 @@ arguments to Docker. For example:
   # Allocate extra space in /dev/shm to enable NCCL
   export CI_DOCKER_EXTRA_PARAMS_INIT='--shm-size=4g'
   # Run multi-GPU test suite
-  tests/ci_build/ci_build.sh gpu nvidia-docker --build-arg CUDA_VERSION_ARG=11.0 \
+  tests/ci_build/ci_build.sh gpu --use-gpus --build-arg CUDA_VERSION_ARG=11.0 \
     tests/ci_build/test_python.sh mgpu
 
 To pass multiple extra arguments:
@@ -131,7 +130,7 @@ set up a credential pair in order to provision resources on AWS. See
 Worker Image Pipeline
 =====================
 Building images for worker machines used to be a chore: you'd provision an EC2 machine, SSH into it, and
-manually install the necessary packages. This process is not only laborous but also error-prone. You may
+manually install the necessary packages. This process is not only laborious but also error-prone. You may
 forget to install a package or change a system configuration.
 
 No more. Now we have an automated pipeline for building images for worker machines.

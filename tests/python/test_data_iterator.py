@@ -1,4 +1,7 @@
-from typing import Callable, Dict, List
+import os
+import tempfile
+import weakref
+from typing import Any, Callable, Dict, List
 
 import numpy as np
 import pytest
@@ -64,7 +67,8 @@ def run_data_iterator(
     subsample_rate = 0.8 if subsample else 1.0
 
     it = IteratorForTest(
-        *make_batches(n_samples_per_batch, n_features, n_batches, use_cupy)
+        *make_batches(n_samples_per_batch, n_features, n_batches, use_cupy),
+        cache="cache"
     )
     if n_batches == 0:
         with pytest.raises(ValueError, match="1 batch"):
@@ -178,5 +182,54 @@ def test_data_cache() -> None:
     data = make_batches(n_samples_per_batch, n_features, n_batches, False)
     batches = [v[0] for v in data]
     it = IterForCacheTest(*batches)
+    transform = xgb.data._proxy_transform
+
+    called = 0
+
+    def mock(*args: Any, **kwargs: Any) -> Any:
+        nonlocal called
+        called += 1
+        return transform(*args, **kwargs)
+
+    xgb.data._proxy_transform = mock
     xgb.QuantileDMatrix(it)
-    assert it._input_id == id(batches[0])
+    assert it._data_ref is weakref.ref(batches[0])
+    assert called == 1
+
+    xgb.data._proxy_transform = transform
+
+
+def test_cat_check() -> None:
+    n_batches = 3
+    n_features = 2
+    n_samples_per_batch = 16
+
+    batches = []
+
+    for i in range(n_batches):
+        X, y = tm.make_categorical(
+            n_samples=n_samples_per_batch,
+            n_features=n_features,
+            n_categories=3,
+            onehot=False,
+        )
+        batches.append((X, y))
+
+    X, y = list(zip(*batches))
+    it = tm.IteratorForTest(X, y, None, cache=None)
+    Xy: xgb.DMatrix = xgb.QuantileDMatrix(it, enable_categorical=True)
+
+    with pytest.raises(ValueError, match="categorical features"):
+        xgb.train({"tree_method": "exact"}, Xy)
+
+    Xy = xgb.DMatrix(X[0], y[0], enable_categorical=True)
+    with pytest.raises(ValueError, match="categorical features"):
+        xgb.train({"tree_method": "exact"}, Xy)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache_path = os.path.join(tmpdir, "cache")
+
+        it = tm.IteratorForTest(X, y, None, cache=cache_path)
+        Xy = xgb.DMatrix(it, enable_categorical=True)
+        with pytest.raises(ValueError, match="categorical features"):
+            xgb.train({"booster": "gblinear"}, Xy)

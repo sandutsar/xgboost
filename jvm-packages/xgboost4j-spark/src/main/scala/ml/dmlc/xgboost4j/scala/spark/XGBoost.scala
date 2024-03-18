@@ -23,7 +23,6 @@ import scala.util.Random
 import scala.collection.JavaConverters._
 
 import ml.dmlc.xgboost4j.java.{Communicator, IRabitTracker, XGBoostError, RabitTracker => PyRabitTracker}
-import ml.dmlc.xgboost4j.scala.spark.params.LearningTaskParams
 import ml.dmlc.xgboost4j.scala.ExternalCheckpointManager
 import ml.dmlc.xgboost4j.scala.{XGBoost => SXGBoost, _}
 import ml.dmlc.xgboost4j.{LabeledPoint => XGBLabeledPoint}
@@ -32,7 +31,8 @@ import org.apache.commons.logging.LogFactory
 import org.apache.hadoop.fs.FileSystem
 
 import org.apache.spark.rdd.RDD
-import org.apache.spark.{SparkContext, TaskContext}
+import org.apache.spark.resource.{ResourceProfileBuilder, TaskResourceRequests}
+import org.apache.spark.{SparkConf, SparkContext, TaskContext}
 import org.apache.spark.sql.SparkSession
 
 /**
@@ -55,9 +55,6 @@ object TrackerConf {
   def apply(): TrackerConf = TrackerConf(0L)
 }
 
-private[scala] case class XGBoostExecutionEarlyStoppingParams(numEarlyStoppingRounds: Int,
-                                                             maximizeEvalMetrics: Boolean)
-
 private[scala] case class XGBoostExecutionInputParams(trainTestRatio: Double, seed: Long)
 
 private[scala] case class XGBoostExecutionParams(
@@ -71,10 +68,13 @@ private[scala] case class XGBoostExecutionParams(
     trackerConf: TrackerConf,
     checkpointParam: Option[ExternalCheckpointParams],
     xgbInputParams: XGBoostExecutionInputParams,
-    earlyStoppingParams: XGBoostExecutionEarlyStoppingParams,
+    earlyStoppingRounds: Int,
     cacheTrainingSet: Boolean,
-    treeMethod: Option[String],
-    isLocal: Boolean) {
+    device: Option[String],
+    isLocal: Boolean,
+    featureNames: Option[Array[String]],
+    featureTypes: Option[Array[String]],
+    runOnGpu: Boolean) {
 
   private var rawParamMap: Map[String, Any] = _
 
@@ -95,12 +95,14 @@ private[this] class XGBoostExecutionParamsFactory(rawParams: Map[String, Any], s
 
   private val overridedParams = overrideParams(rawParams, sc)
 
+  validateSparkSslConf()
+
   /**
    * Check to see if Spark expects SSL encryption (`spark.ssl.enabled` set to true).
    * If so, throw an exception unless this safety measure has been explicitly overridden
    * via conf `xgboost.spark.ignoreSsl`.
    */
-  private def validateSparkSslConf: Unit = {
+  private def validateSparkSslConf(): Unit = {
     val (sparkSslEnabled: Boolean, xgboostSparkIgnoreSsl: Boolean) =
       SparkSession.getActiveSession match {
         case Some(ss) =>
@@ -144,83 +146,94 @@ private[this] class XGBoostExecutionParamsFactory(rawParams: Map[String, Any], s
     val numEarlyStoppingRounds = overridedParams.getOrElse(
       "num_early_stopping_rounds", 0).asInstanceOf[Int]
     overridedParams += "num_early_stopping_rounds" -> numEarlyStoppingRounds
-    if (numEarlyStoppingRounds > 0 &&
-      !overridedParams.contains("maximize_evaluation_metrics")) {
-      if (overridedParams.getOrElse("custom_eval", null) != null) {
+    if (numEarlyStoppingRounds > 0 && overridedParams.getOrElse("custom_eval", null) != null) {
         throw new IllegalArgumentException("custom_eval does not support early stopping")
-      }
-      val eval_metric = overridedParams("eval_metric").toString
-      val maximize = LearningTaskParams.evalMetricsToMaximize contains eval_metric
-      logger.info("parameter \"maximize_evaluation_metrics\" is set to " + maximize)
-      overridedParams += ("maximize_evaluation_metrics" -> maximize)
     }
     overridedParams
   }
 
+  /**
+   * The Map parameters accepted by estimator's constructor may have string type,
+   * Eg, Map("num_workers" -> "6", "num_round" -> 5), we need to convert these
+   * kind of parameters into the correct type in the function.
+   *
+   * @return XGBoostExecutionParams
+   */
   def buildXGBRuntimeParams: XGBoostExecutionParams = {
-    val nWorkers = overridedParams("num_workers").asInstanceOf[Int]
-    val round = overridedParams("num_round").asInstanceOf[Int]
-    val useExternalMemory = overridedParams
-      .getOrElse("use_external_memory", false).asInstanceOf[Boolean]
+
     val obj = overridedParams.getOrElse("custom_obj", null).asInstanceOf[ObjectiveTrait]
     val eval = overridedParams.getOrElse("custom_eval", null).asInstanceOf[EvalTrait]
-    val missing = overridedParams.getOrElse("missing", Float.NaN).asInstanceOf[Float]
-    val allowNonZeroForMissing = overridedParams
-                                 .getOrElse("allow_non_zero_for_missing", false)
-                                 .asInstanceOf[Boolean]
-    validateSparkSslConf
-    var treeMethod: Option[String] = None
-    if (overridedParams.contains("tree_method")) {
-      require(overridedParams("tree_method") == "hist" ||
-        overridedParams("tree_method") == "approx" ||
-        overridedParams("tree_method") == "auto" ||
-        overridedParams("tree_method") == "gpu_hist", "xgboost4j-spark only supports tree_method" +
-        " as 'hist', 'approx', 'gpu_hist', and 'auto'")
-      treeMethod = Some(overridedParams("tree_method").asInstanceOf[String])
-    }
-    if (overridedParams.contains("train_test_ratio")) {
-      logger.warn("train_test_ratio is deprecated since XGBoost 0.82, we recommend to explicitly" +
-        " pass a training and multiple evaluation datasets by passing 'eval_sets' and " +
-        "'eval_set_names'")
-    }
-    require(nWorkers > 0, "you must specify more than 0 workers")
     if (obj != null) {
       require(overridedParams.get("objective_type").isDefined, "parameter \"objective_type\" " +
         "is not defined, you have to specify the objective type as classification or regression" +
         " with a customized objective function")
     }
+
+    var trainTestRatio = 1.0
+    if (overridedParams.contains("train_test_ratio")) {
+      logger.warn("train_test_ratio is deprecated since XGBoost 0.82, we recommend to explicitly" +
+        " pass a training and multiple evaluation datasets by passing 'eval_sets' and " +
+        "'eval_set_names'")
+      trainTestRatio = overridedParams.get("train_test_ratio").get.asInstanceOf[Double]
+    }
+
+    val nWorkers = overridedParams("num_workers").asInstanceOf[Int]
+    val round = overridedParams("num_round").asInstanceOf[Int]
+    val useExternalMemory = overridedParams
+      .getOrElse("use_external_memory", false).asInstanceOf[Boolean]
+
+    val missing = overridedParams.getOrElse("missing", Float.NaN).asInstanceOf[Float]
+    val allowNonZeroForMissing = overridedParams
+                                 .getOrElse("allow_non_zero_for_missing", false)
+                                 .asInstanceOf[Boolean]
+
+    val treeMethod: Option[String] = overridedParams.get("tree_method").map(_.toString)
+    val device: Option[String] = overridedParams.get("device").map(_.toString)
+    val deviceIsGpu = device.exists(_ == "cuda")
+
+    require(!(treeMethod.exists(_ == "approx") && deviceIsGpu),
+      "The tree method \"approx\" is not yet supported for Spark GPU cluster")
+
+    // back-compatible with "gpu_hist"
+    val runOnGpu = treeMethod.exists(_ == "gpu_hist") || deviceIsGpu
+
     val trackerConf = overridedParams.get("tracker_conf") match {
       case None => TrackerConf()
       case Some(conf: TrackerConf) => conf
       case _ => throw new IllegalArgumentException("parameter \"tracker_conf\" must be an " +
         "instance of TrackerConf.")
     }
-    val checkpointParam =
-      ExternalCheckpointParams.extractParams(overridedParams)
 
-    val trainTestRatio = overridedParams.getOrElse("train_test_ratio", 1.0)
-      .asInstanceOf[Double]
+    val checkpointParam = ExternalCheckpointParams.extractParams(overridedParams)
+
     val seed = overridedParams.getOrElse("seed", System.nanoTime()).asInstanceOf[Long]
     val inputParams = XGBoostExecutionInputParams(trainTestRatio, seed)
 
     val earlyStoppingRounds = overridedParams.getOrElse(
       "num_early_stopping_rounds", 0).asInstanceOf[Int]
-    val maximizeEvalMetrics = overridedParams.getOrElse(
-      "maximize_evaluation_metrics", true).asInstanceOf[Boolean]
-    val xgbExecEarlyStoppingParams = XGBoostExecutionEarlyStoppingParams(earlyStoppingRounds,
-      maximizeEvalMetrics)
 
     val cacheTrainingSet = overridedParams.getOrElse("cache_training_set", false)
       .asInstanceOf[Boolean]
+
+    val featureNames = if (overridedParams.contains("feature_names")) {
+      Some(overridedParams("feature_names").asInstanceOf[Array[String]])
+    } else None
+    val featureTypes = if (overridedParams.contains("feature_types")){
+      Some(overridedParams("feature_types").asInstanceOf[Array[String]])
+    } else None
 
     val xgbExecParam = XGBoostExecutionParams(nWorkers, round, useExternalMemory, obj, eval,
       missing, allowNonZeroForMissing, trackerConf,
       checkpointParam,
       inputParams,
-      xgbExecEarlyStoppingParams,
+      earlyStoppingRounds,
       cacheTrainingSet,
-      treeMethod,
-      isLocal)
+      device,
+      isLocal,
+      featureNames,
+      featureTypes,
+      runOnGpu
+    )
     xgbExecParam.setRawParamMap(overridedParams)
     xgbExecParam
   }
@@ -244,7 +257,132 @@ private[this] class XGBoostExecutionParamsFactory(rawParams: Map[String, Any], s
   )
 }
 
-object XGBoost extends Serializable {
+/**
+ * A trait to manage stage-level scheduling
+ */
+private[spark] trait XGBoostStageLevel extends Serializable {
+  private val logger = LogFactory.getLog("XGBoostSpark")
+
+  private[spark] def isStandaloneOrLocalCluster(conf: SparkConf): Boolean = {
+    val master = conf.get("spark.master")
+    master != null && (master.startsWith("spark://") || master.startsWith("local-cluster"))
+  }
+
+  /**
+   * To determine if stage-level scheduling should be skipped according to the spark version
+   * and spark configurations
+   *
+   * @param sparkVersion spark version
+   * @param runOnGpu     if xgboost training run on GPUs
+   * @param conf         spark configurations
+   * @return Boolean to skip stage-level scheduling or not
+   */
+  private[spark] def skipStageLevelScheduling(
+      sparkVersion: String,
+      runOnGpu: Boolean,
+      conf: SparkConf): Boolean = {
+    if (runOnGpu) {
+      if (sparkVersion < "3.4.0") {
+        logger.info("Stage-level scheduling in xgboost requires spark version 3.4.0+")
+        return true
+      }
+
+      if (!isStandaloneOrLocalCluster(conf)) {
+        logger.info("Stage-level scheduling in xgboost requires spark standalone or " +
+          "local-cluster mode")
+        return true
+      }
+
+      val executorCores = conf.getInt("spark.executor.cores", -1)
+      val executorGpus = conf.getInt("spark.executor.resource.gpu.amount", -1)
+      if (executorCores == -1 || executorGpus == -1) {
+        logger.info("Stage-level scheduling in xgboost requires spark.executor.cores, " +
+          "spark.executor.resource.gpu.amount to be set.")
+        return true
+      }
+
+      if (executorCores == 1) {
+        logger.info("Stage-level scheduling in xgboost requires spark.executor.cores > 1")
+        return true
+      }
+
+      if (executorGpus > 1) {
+        logger.info("Stage-level scheduling in xgboost will not work " +
+          "when spark.executor.resource.gpu.amount > 1")
+        return true
+      }
+
+      val taskGpuAmount = conf.getDouble("spark.task.resource.gpu.amount", -1.0).toFloat
+
+      if (taskGpuAmount == -1.0) {
+        // The ETL tasks will not grab a gpu when spark.task.resource.gpu.amount is not set,
+        // but with stage-level scheduling, we can make training task grab the gpu.
+        return false
+      }
+
+      if (taskGpuAmount == executorGpus.toFloat) {
+        // spark.executor.resource.gpu.amount = spark.task.resource.gpu.amount
+        // results in only 1 task running at a time, which may cause perf issue.
+        return true
+      }
+      // We can enable stage-level scheduling
+      false
+    } else true // Skip stage-level scheduling for cpu training.
+  }
+
+  /**
+   * Attempt to modify the task resources so that only one task can be executed
+   * on a single executor simultaneously.
+   *
+   * @param sc  the spark context
+   * @param rdd which rdd to be applied with new resource profile
+   * @return the original rdd or the changed rdd
+   */
+  private[spark] def tryStageLevelScheduling(
+      sc: SparkContext,
+      xgbExecParams: XGBoostExecutionParams,
+      rdd: RDD[(Booster, Map[String, Array[Float]])]
+    ): RDD[(Booster, Map[String, Array[Float]])] = {
+
+    val conf = sc.getConf
+    if (skipStageLevelScheduling(sc.version, xgbExecParams.runOnGpu, conf)) {
+      return rdd
+    }
+
+    // Ensure executor_cores is not None
+    val executor_cores = conf.getInt("spark.executor.cores", -1)
+    if (executor_cores == -1) {
+      throw new RuntimeException("Wrong spark.executor.cores")
+    }
+
+    // Spark-rapids is a GPU-acceleration project for Spark SQL.
+    // When spark-rapids is enabled, we prevent concurrent execution of other ETL tasks
+    // that utilize GPUs alongside training tasks in order to avoid GPU out-of-memory errors.
+    val spark_plugins = conf.get("spark.plugins", " ")
+    val spark_rapids_sql_enabled = conf.get("spark.rapids.sql.enabled", "true")
+
+    // Determine the number of cores required for each task.
+    val task_cores = if (spark_plugins.contains("com.nvidia.spark.SQLPlugin") &&
+      spark_rapids_sql_enabled.toLowerCase == "true") {
+      executor_cores
+    } else {
+      (executor_cores / 2) + 1
+    }
+
+    // Each training task requires cpu cores > total executor cores//2 + 1 to
+    // ensure tasks are sent to different executors.
+    // Note: We cannot use GPUs to limit concurrent tasks
+    // due to https://issues.apache.org/jira/browse/SPARK-45527.
+    val task_gpus = 1.0
+    val treqs = new TaskResourceRequests().cpus(task_cores).resource("gpu", task_gpus)
+    val rp = new ResourceProfileBuilder().require(treqs).build()
+
+    logger.info(s"XGBoost training tasks require the resource(cores=$task_cores, gpu=$task_gpus).")
+    rdd.withResources(rp)
+  }
+}
+
+object XGBoost extends XGBoostStageLevel {
   private val logger = LogFactory.getLog("XGBoostSpark")
 
   def getGPUAddrFromResources: Int = {
@@ -301,12 +439,12 @@ object XGBoost extends Serializable {
 
       watches = buildWatchesAndCheck(buildWatches)
 
-      val numEarlyStoppingRounds = xgbExecutionParam.earlyStoppingParams.numEarlyStoppingRounds
+      val numEarlyStoppingRounds = xgbExecutionParam.earlyStoppingRounds
       val metrics = Array.tabulate(watches.size)(_ => Array.ofDim[Float](numRounds))
       val externalCheckpointParams = xgbExecutionParam.checkpointParam
 
       var params = xgbExecutionParam.toMap
-      if (xgbExecutionParam.treeMethod.exists(m => m == "gpu_hist")) {
+      if (xgbExecutionParam.runOnGpu) {
         val gpuId = if (xgbExecutionParam.isLocal) {
           // For local mode, force gpu id to primary device
           0
@@ -314,8 +452,9 @@ object XGBoost extends Serializable {
           getGPUAddrFromResources
         }
         logger.info("Leveraging gpu device " + gpuId + " to train")
-        params = params + ("gpu_id" -> gpuId)
+        params = params + ("device" -> s"cuda:$gpuId")
       }
+
       val booster = if (makeCheckpoint) {
         SXGBoost.trainAndSaveCheckpoint(
           watches.toMap("train"), params, numRounds,
@@ -403,7 +542,12 @@ object XGBoost extends Serializable {
 
         }}
 
-        val (booster, metrics) = boostersAndMetrics.collect()(0)
+        val boostersAndMetricsWithRes = tryStageLevelScheduling(sc, xgbExecParams,
+          boostersAndMetrics)
+        // The repartition step is to make training stage as ShuffleMapStage, so that when one
+        // of the training task fails the training stage can retry. ResultStage won't retry when
+        // it fails.
+        val (booster, metrics) = boostersAndMetricsWithRes.repartition(1).collect()(0)
         val trackerReturnVal = tracker.waitFor(0L)
         logger.info(s"Rabit returns with exit code $trackerReturnVal")
         if (trackerReturnVal != 0) {
@@ -531,6 +675,16 @@ private object Watches {
     if (trainMargin.isDefined) trainMatrix.setBaseMargin(trainMargin.get)
     if (testMargin.isDefined) testMatrix.setBaseMargin(testMargin.get)
 
+    if (xgbExecutionParams.featureNames.isDefined) {
+      trainMatrix.setFeatureNames(xgbExecutionParams.featureNames.get)
+      testMatrix.setFeatureNames(xgbExecutionParams.featureNames.get)
+    }
+
+    if (xgbExecutionParams.featureTypes.isDefined) {
+      trainMatrix.setFeatureTypes(xgbExecutionParams.featureTypes.get)
+      testMatrix.setFeatureTypes(xgbExecutionParams.featureTypes.get)
+    }
+
     new Watches(Array(trainMatrix, testMatrix), Array("train", "test"), cacheDirName)
   }
 
@@ -642,6 +796,15 @@ private object Watches {
     val testMargin = fromBaseMarginsToArray(testBaseMargins.result().iterator)
     if (trainMargin.isDefined) trainMatrix.setBaseMargin(trainMargin.get)
     if (testMargin.isDefined) testMatrix.setBaseMargin(testMargin.get)
+
+    if (xgbExecutionParams.featureNames.isDefined) {
+      trainMatrix.setFeatureNames(xgbExecutionParams.featureNames.get)
+      testMatrix.setFeatureNames(xgbExecutionParams.featureNames.get)
+    }
+    if (xgbExecutionParams.featureTypes.isDefined) {
+      trainMatrix.setFeatureTypes(xgbExecutionParams.featureTypes.get)
+      testMatrix.setFeatureTypes(xgbExecutionParams.featureTypes.get)
+    }
 
     new Watches(Array(trainMatrix, testMatrix), Array("train", "test"), cacheDirName)
   }

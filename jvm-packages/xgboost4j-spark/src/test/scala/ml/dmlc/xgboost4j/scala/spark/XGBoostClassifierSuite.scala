@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014-2022 by Contributors
+ Copyright (c) 2014-2024 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -27,6 +27,8 @@ import org.apache.commons.io.IOUtils
 
 import org.apache.spark.Partitioner
 import org.apache.spark.ml.feature.VectorAssembler
+import org.json4s.{DefaultFormats, Formats}
+import org.json4s.jackson.parseJson
 
 class XGBoostClassifierSuite extends AnyFunSuite with PerTest with TmpFolderPerSuite {
 
@@ -430,6 +432,7 @@ class XGBoostClassifierSuite extends AnyFunSuite with PerTest with TmpFolderPerS
     val xgb = new XGBoostClassifier(paramMap)
     val model = xgb.fit(trainingDF)
 
+    // test json
     val modelPath = new File(tempDir.toFile, "xgbc").getPath
     model.write.option("format", "json").save(modelPath)
     val nativeJsonModelPath = new File(tempDir.toFile, "nativeModel.json").getPath
@@ -437,20 +440,41 @@ class XGBoostClassifierSuite extends AnyFunSuite with PerTest with TmpFolderPerS
     assert(compareTwoFiles(new File(modelPath, "data/XGBoostClassificationModel").getPath,
       nativeJsonModelPath))
 
-    // test default "deprecated"
+    // test ubj
     val modelUbjPath = new File(tempDir.toFile, "xgbcUbj").getPath
     model.write.save(modelUbjPath)
-    val nativeDeprecatedModelPath = new File(tempDir.toFile, "nativeModel").getPath
-    model.nativeBooster.saveModel(nativeDeprecatedModelPath)
+    val nativeUbjModelPath = new File(tempDir.toFile, "nativeModel.ubj").getPath
+    model.nativeBooster.saveModel(nativeUbjModelPath)
     assert(compareTwoFiles(new File(modelUbjPath, "data/XGBoostClassificationModel").getPath,
-      nativeDeprecatedModelPath))
+      nativeUbjModelPath))
 
     // json file should be indifferent with ubj file
     val modelJsonPath = new File(tempDir.toFile, "xgbcJson").getPath
     model.write.option("format", "json").save(modelJsonPath)
-    val nativeUbjModelPath = new File(tempDir.toFile, "nativeModel1.ubj").getPath
-    model.nativeBooster.saveModel(nativeUbjModelPath)
+    val nativeUbjModelPath1 = new File(tempDir.toFile, "nativeModel1.ubj").getPath
+    model.nativeBooster.saveModel(nativeUbjModelPath1)
     assert(!compareTwoFiles(new File(modelJsonPath, "data/XGBoostClassificationModel").getPath,
-      nativeUbjModelPath))
+      nativeUbjModelPath1))
+  }
+
+  test("native json model file should store feature_name and feature_type") {
+    val featureNames = (1 to 33).map(idx => s"feature_${idx}").toArray
+    val featureTypes = (1 to 33).map(idx => "q").toArray
+    val paramMap = Map("eta" -> "0.1", "max_depth" -> "6", "silent" -> "1",
+      "objective" -> "multi:softprob", "num_class" -> "6", "num_round" -> 5,
+      "num_workers" -> numWorkers, "tree_method" -> treeMethod
+    )
+    val trainingDF = buildDataFrame(MultiClassification.train)
+    val xgb = new XGBoostClassifier(paramMap)
+      .setFeatureNames(featureNames)
+      .setFeatureTypes(featureTypes)
+    val model = xgb.fit(trainingDF)
+    val modelStr = new String(model._booster.toByteArray("json"))
+    val jsonModel = parseJson(modelStr)
+    implicit val formats: Formats = DefaultFormats
+    val featureNamesInModel = (jsonModel \ "learner" \ "feature_names").extract[List[String]]
+    val featureTypesInModel = (jsonModel \ "learner" \ "feature_types").extract[List[String]]
+    assert(featureNamesInModel.length == 33)
+    assert(featureTypesInModel.length == 33)
   }
 }

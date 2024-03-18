@@ -1,8 +1,8 @@
 Package: xgboost
 Type: Package
 Title: Extreme Gradient Boosting
-Version: 2.0.0.1
-Date: 2022-10-18
+Version: 2.1.0.0
+Date: 2023-08-19
 Authors@R: c(
   person("Tianqi", "Chen", role = c("aut"),
          email = "tianqi.tchen@gmail.com"),
@@ -56,14 +56,16 @@ Suggests:
     testthat,
     igraph (>= 1.0.1),
     float,
-    titanic
+    titanic,
+    RhpcBLASctl
 Depends:
-    R (>= 3.3.0)
+    R (>= 4.3.0)
 Imports:
     Matrix (>= 1.1-0),
     methods,
     data.table (>= 1.9.6),
-    jsonlite (>= 1.0),
-RoxygenNote: 7.2.3
+    jsonlite (>= 1.0)
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
 Encoding: UTF-8
 SystemRequirements: GNU make, C++17

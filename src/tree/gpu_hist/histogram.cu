@@ -1,5 +1,5 @@
 /**
- * Copyright 2020-2023 by XGBoost Contributors
+ * Copyright 2020-2024, XGBoost Contributors
  */
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/reduce.h>
@@ -8,6 +8,7 @@
 #include <cstdint>  // uint32_t
 #include <limits>
 
+#include "../../collective/aggregator.h"
 #include "../../common/deterministic.cuh"
 #include "../../common/device_helpers.cuh"
 #include "../../data/ellpack_page.cuh"
@@ -15,8 +16,7 @@
 #include "row_partitioner.cuh"
 #include "xgboost/base.h"
 
-namespace xgboost {
-namespace tree {
+namespace xgboost::tree {
 namespace {
 struct Pair {
   GradientPair first;
@@ -52,7 +52,8 @@ struct Clip : public thrust::unary_function<GradientPair, Pair> {
  *
  * to avoid outliers, as the full reduction is reproducible on GPU with reduction tree.
  */
-GradientQuantiser::GradientQuantiser(common::Span<GradientPair const> gpair) {
+GradientQuantiser::GradientQuantiser(Context const* ctx, common::Span<GradientPair const> gpair,
+                                     MetaInfo const& info) {
   using GradientSumT = GradientPairPrecise;
   using T = typename GradientSumT::ValueT;
   dh::XGBCachingDeviceAllocator<char> alloc;
@@ -64,11 +65,14 @@ GradientQuantiser::GradientQuantiser(common::Span<GradientPair const> gpair) {
   // Treat pair as array of 4 primitive types to allreduce
   using ReduceT = typename decltype(p.first)::ValueT;
   static_assert(sizeof(Pair) == sizeof(ReduceT) * 4, "Expected to reduce four elements.");
-  collective::Allreduce<collective::Operation::kSum>(reinterpret_cast<ReduceT*>(&p), 4);
+  auto rc = collective::GlobalSum(ctx, info, linalg::MakeVec(reinterpret_cast<ReduceT*>(&p), 4));
+  collective::SafeColl(rc);
+
   GradientPair positive_sum{p.first}, negative_sum{p.second};
 
   std::size_t total_rows = gpair.size();
-  collective::Allreduce<collective::Operation::kSum>(&total_rows, 1);
+  rc = collective::GlobalSum(ctx, info, linalg::MakeVec(&total_rows, 1));
+  collective::SafeColl(rc);
 
   auto histogram_rounding =
       GradientSumT{common::CreateRoundingFactor<T>(
@@ -97,7 +101,6 @@ GradientQuantiser::GradientQuantiser(common::Span<GradientPair const> gpair) {
   to_fixed_point_ = GradientSumT(static_cast<T>(1) / to_floating_point_.GetGrad(),
                                  static_cast<T>(1) / to_floating_point_.GetHess());
 }
-
 
 XGBOOST_DEV_INLINE void
 AtomicAddGpairShared(xgboost::GradientPairInt64 *dest,
@@ -313,6 +316,4 @@ void BuildGradientHistogram(CUDAContext const* ctx, EllpackDeviceAccessor const&
 
   dh::safe_cuda(cudaGetLastError());
 }
-
-}  // namespace tree
-}  // namespace xgboost
+}  // namespace xgboost::tree

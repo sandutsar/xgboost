@@ -4,13 +4,13 @@
 #include "../test_evaluate_splits.h"
 
 #include <gtest/gtest.h>
-#include <xgboost/base.h>                               // for GradientPairPrecise, Args, Gradie...
-#include <xgboost/context.h>                            // for Context
-#include <xgboost/data.h>                               // for FeatureType, DMatrix, MetaInfo
-#include <xgboost/logging.h>                            // for CHECK_EQ
-#include <xgboost/tree_model.h>                         // for RegTree, RTreeNodeStat
+#include <xgboost/base.h>        // for GradientPairPrecise, Args, Gradie...
+#include <xgboost/context.h>     // for Context
+#include <xgboost/data.h>        // for FeatureType, DMatrix, MetaInfo
+#include <xgboost/logging.h>     // for CHECK_EQ
+#include <xgboost/tree_model.h>  // for RegTree, RTreeNodeStat
 
-#include <memory>                                       // for make_shared, shared_ptr, addressof
+#include <memory>  // for make_shared, shared_ptr, addressof
 
 #include "../../../../src/common/hist_util.h"           // for HistCollection, HistogramCuts
 #include "../../../../src/common/random.h"              // for ColumnSampler
@@ -18,6 +18,8 @@
 #include "../../../../src/data/gradient_index.h"        // for GHistIndexMatrix
 #include "../../../../src/tree/hist/evaluate_splits.h"  // for HistEvaluator
 #include "../../../../src/tree/hist/expand_entry.h"     // for CPUExpandEntry
+#include "../../../../src/tree/hist/hist_cache.h"       // for BoundedHistCollection
+#include "../../../../src/tree/hist/param.h"            // for HistMakerTrainParam
 #include "../../../../src/tree/param.h"                 // for GradStats, TrainParam
 #include "../../helpers.h"                              // for RandomDataGenerator, AllThreadsFo...
 
@@ -26,7 +28,7 @@ void TestEvaluateSplits(bool force_read_by_column) {
   Context ctx;
   ctx.nthread = 4;
   int static constexpr kRows = 8, kCols = 16;
-  auto sampler = std::make_shared<common::ColumnSampler>();
+  auto sampler = std::make_shared<common::ColumnSampler>(1u);
 
   TrainParam param;
   param.UpdateAllowUnknown(Args{{"min_child_weight", "0"}, {"reg_lambda", "0"}});
@@ -34,7 +36,7 @@ void TestEvaluateSplits(bool force_read_by_column) {
   auto dmat = RandomDataGenerator(kRows, kCols, 0).Seed(3).GenerateDMatrix();
 
   auto evaluator = HistEvaluator{&ctx, &param, dmat->Info(), sampler};
-  common::HistCollection hist;
+  BoundedHistCollection hist;
   std::vector<GradientPair> row_gpairs = {
       {1.23f, 0.24f}, {0.24f, 0.25f}, {0.26f, 0.27f},  {2.27f, 0.28f},
       {0.27f, 0.29f}, {0.37f, 0.39f}, {-0.47f, 0.49f}, {0.57f, 0.59f}};
@@ -48,12 +50,10 @@ void TestEvaluateSplits(bool force_read_by_column) {
   std::iota(row_indices.begin(), row_indices.end(), 0);
   row_set_collection.Init();
 
-  auto hist_builder = common::GHistBuilder(gmat.cut.Ptrs().back());
-  hist.Init(gmat.cut.Ptrs().back());
-  hist.AddHistRow(0);
-  hist.AllocateAllData();
-  hist_builder.template BuildHist<false>(row_gpairs, row_set_collection[0],
-                                         gmat, hist[0], force_read_by_column);
+  HistMakerTrainParam hist_param;
+  hist.Reset(gmat.cut.Ptrs().back(), hist_param.max_cached_hist_node);
+  hist.AllocateHistograms({0});
+  common::BuildHist<false>(row_gpairs, row_set_collection[0], gmat, hist[0], force_read_by_column);
 
   // Compute total gradient for all data points
   GradientPairPrecise total_gpair;
@@ -102,7 +102,7 @@ TEST(HistMultiEvaluator, Evaluate) {
 
   TrainParam param;
   param.Init(Args{{"min_child_weight", "0"}, {"reg_lambda", "0"}});
-  auto sampler = std::make_shared<common::ColumnSampler>();
+  auto sampler = std::make_shared<common::ColumnSampler>(1u);
 
   std::size_t n_samples = 3;
   bst_feature_t n_features = 2;
@@ -113,13 +113,13 @@ TEST(HistMultiEvaluator, Evaluate) {
       RandomDataGenerator{n_samples, n_features, 0.5}.Targets(n_targets).GenerateDMatrix(true);
 
   HistMultiEvaluator evaluator{&ctx, p_fmat->Info(), &param, sampler};
-  std::vector<common::HistCollection> histogram(n_targets);
-  linalg::Vector<GradientPairPrecise> root_sum({2}, Context::kCpuId);
+  HistMakerTrainParam hist_param;
+  std::vector<BoundedHistCollection> histogram(n_targets);
+  linalg::Vector<GradientPairPrecise> root_sum({2}, DeviceOrd::CPU());
   for (bst_target_t t{0}; t < n_targets; ++t) {
     auto &hist = histogram[t];
-    hist.Init(n_bins * n_features);
-    hist.AddHistRow(0);
-    hist.AllocateAllData();
+    hist.Reset(n_bins * n_features, hist_param.max_cached_hist_node);
+    hist.AllocateHistograms({0});
     auto node_hist = hist[0];
     node_hist[0] = {-0.5, 0.5};
     node_hist[1] = {2.0, 0.5};
@@ -145,7 +145,7 @@ TEST(HistMultiEvaluator, Evaluate) {
 
   std::vector<MultiExpandEntry> entries(1, {/*nidx=*/0, /*depth=*/0});
 
-  std::vector<common::HistCollection const *> ptrs;
+  std::vector<BoundedHistCollection const *> ptrs;
   std::transform(histogram.cbegin(), histogram.cend(), std::back_inserter(ptrs),
                  [](auto const &h) { return std::addressof(h); });
 
@@ -166,7 +166,7 @@ TEST(HistEvaluator, Apply) {
   TrainParam param;
   param.UpdateAllowUnknown(Args{{"min_child_weight", "0"}, {"reg_lambda", "0.0"}});
   auto dmat = RandomDataGenerator(kNRows, kNCols, 0).Seed(3).GenerateDMatrix();
-  auto sampler = std::make_shared<common::ColumnSampler>();
+  auto sampler = std::make_shared<common::ColumnSampler>(1u);
   auto evaluator_ = HistEvaluator{&ctx, &param, dmat->Info(), sampler};
 
   CPUExpandEntry entry{0, 0};
@@ -194,7 +194,7 @@ TEST_F(TestPartitionBasedSplit, CPUHist) {
   Context ctx;
   // check the evaluator is returning the optimal split
   std::vector<FeatureType> ft{FeatureType::kCategorical};
-  auto sampler = std::make_shared<common::ColumnSampler>();
+  auto sampler = std::make_shared<common::ColumnSampler>(1u);
   HistEvaluator evaluator{&ctx, &param_, info_, sampler};
   evaluator.InitRoot(GradStats{total_gpair_});
   RegTree tree;
@@ -224,19 +224,19 @@ auto CompareOneHotAndPartition(bool onehot) {
   auto dmat =
       RandomDataGenerator(kRows, kCols, 0).Seed(3).Type(ft).MaxCategory(n_cats).GenerateDMatrix();
 
-  auto sampler = std::make_shared<common::ColumnSampler>();
+  auto sampler = std::make_shared<common::ColumnSampler>(1u);
   auto evaluator = HistEvaluator{&ctx, &param, dmat->Info(), sampler};
   std::vector<CPUExpandEntry> entries(1);
+  HistMakerTrainParam hist_param;
 
   for (auto const &gmat : dmat->GetBatches<GHistIndexMatrix>(&ctx, {32, param.sparse_threshold})) {
-    common::HistCollection hist;
+    BoundedHistCollection hist;
 
     entries.front().nid = 0;
     entries.front().depth = 0;
 
-    hist.Init(gmat.cut.TotalBins());
-    hist.AddHistRow(0);
-    hist.AllocateAllData();
+    hist.Reset(gmat.cut.TotalBins(), hist_param.max_cached_hist_node);
+    hist.AllocateHistograms({0});
     auto node_hist = hist[0];
 
     CHECK_EQ(node_hist.size(), n_cats);
@@ -263,15 +263,15 @@ TEST(HistEvaluator, Categorical) {
 }
 
 TEST_F(TestCategoricalSplitWithMissing, HistEvaluator) {
-  common::HistCollection hist;
-  hist.Init(cuts_.TotalBins());
-  hist.AddHistRow(0);
-  hist.AllocateAllData();
+  BoundedHistCollection hist;
+  HistMakerTrainParam hist_param;
+  hist.Reset(cuts_.TotalBins(), hist_param.max_cached_hist_node);
+  hist.AllocateHistograms({0});
   auto node_hist = hist[0];
   ASSERT_EQ(node_hist.size(), feature_histogram_.size());
   std::copy(feature_histogram_.cbegin(), feature_histogram_.cend(), node_hist.begin());
 
-  auto sampler = std::make_shared<common::ColumnSampler>();
+  auto sampler = std::make_shared<common::ColumnSampler>(1u);
   MetaInfo info;
   info.num_col_ = 1;
   info.feature_types = {FeatureType::kCategorical};

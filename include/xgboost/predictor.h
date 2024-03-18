@@ -6,24 +6,22 @@
  */
 #pragma once
 #include <xgboost/base.h>
-#include <xgboost/cache.h>  // DMatrixCache
+#include <xgboost/cache.h>    // for DMatrixCache
+#include <xgboost/context.h>  // for Context
 #include <xgboost/context.h>
 #include <xgboost/data.h>
 #include <xgboost/host_device_vector.h>
 
-#include <functional>  // std::function
-#include <memory>
+#include <functional>  // for function
+#include <memory>      // for shared_ptr
 #include <string>
-#include <thread>   // for get_id
 #include <utility>  // for make_pair
 #include <vector>
 
 // Forward declarations
-namespace xgboost {
-namespace gbm {
+namespace xgboost::gbm {
 struct GBTreeModel;
-}  // namespace gbm
-}  // namespace xgboost
+}  // namespace xgboost::gbm
 
 namespace xgboost {
 /**
@@ -41,9 +39,8 @@ struct PredictionCacheEntry {
    *
    * \param v Added versions.
    */
-  void Update(std::uint32_t v) {
-    version += v;
-  }
+  void Update(std::uint32_t v) { version += v; }
+  void Reset() { version = 0; }
 };
 
 /**
@@ -55,9 +52,9 @@ class PredictionContainer : public DMatrixCache<PredictionCacheEntry> {
 
  public:
   PredictionContainer() : DMatrixCache<PredictionCacheEntry>{DefaultSize()} {}
-  PredictionCacheEntry& Cache(std::shared_ptr<DMatrix> m, std::int32_t device) {
+  PredictionCacheEntry& Cache(std::shared_ptr<DMatrix> m, DeviceOrd device) {
     auto p_cache = this->CacheItem(m);
-    if (device != Context::kCpuId) {
+    if (device.IsCUDA()) {
       p_cache->predictions.SetDevice(device);
     }
     return *p_cache;
@@ -95,8 +92,8 @@ class Predictor {
    * \param out_predt Prediction vector to be initialized.
    * \param model Tree model used for prediction.
    */
-  void InitOutPredictions(const MetaInfo& info, HostDeviceVector<bst_float>* out_predt,
-                          const gbm::GBTreeModel& model) const;
+  virtual void InitOutPredictions(const MetaInfo& info, HostDeviceVector<bst_float>* out_predt,
+                                  const gbm::GBTreeModel& model) const;
 
   /**
    * \brief Generate batch predictions for a given feature matrix. May use
@@ -134,16 +131,18 @@ class Predictor {
    * usually more efficient than online prediction This function is NOT
    * threadsafe, make sure you only call from one thread.
    *
-   * \param           inst        The instance to predict.
-   * \param [in,out]  out_preds   The output preds.
-   * \param           model       The model to predict from
-   * \param           tree_end    (Optional) The tree end index.
+   * \param           inst            The instance to predict.
+   * \param [in,out]  out_preds       The output preds.
+   * \param           model           The model to predict from
+   * \param           tree_end        (Optional) The tree end index.
+   * \param           is_column_split (Optional) If the data is split column-wise.
    */
 
   virtual void PredictInstance(const SparsePage::Inst& inst,
                                std::vector<bst_float>* out_preds,
                                const gbm::GBTreeModel& model,
-                               unsigned tree_end = 0) const = 0;
+                               unsigned tree_end = 0,
+                               bool is_column_split = false) const = 0;
 
   /**
    * \brief predict the leaf index of each tree, the output will be nsample *

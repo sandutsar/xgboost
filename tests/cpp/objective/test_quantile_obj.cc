@@ -10,11 +10,11 @@
 #include <memory>               // std::unique_ptr
 #include <vector>               // std::vector
 
-#include "../helpers.h"         // CheckConfigReload,CreateEmptyGenericParam,DeclareUnifiedTest
+#include "../helpers.h"         // CheckConfigReload,MakeCUDACtx,DeclareUnifiedTest
 
 namespace xgboost {
 TEST(Objective, DeclareUnifiedTest(Quantile)) {
-  Context ctx = CreateEmptyGenericParam(GPUIDX);
+  Context ctx = MakeCUDACtx(GPUIDX);
 
   {
     Args args{{"quantile_alpha", "[0.6, 0.8]"}};
@@ -37,7 +37,7 @@ TEST(Objective, DeclareUnifiedTest(Quantile)) {
 }
 
 TEST(Objective, DeclareUnifiedTest(QuantileIntercept)) {
-  Context ctx = CreateEmptyGenericParam(GPUIDX);
+  Context ctx = MakeCUDACtx(GPUIDX);
   Args args{{"quantile_alpha", "[0.6, 0.8]"}};
   std::unique_ptr<ObjFunction> obj{ObjFunction::Create("reg:quantileerror", &ctx)};
   obj->Configure(args);
@@ -45,7 +45,7 @@ TEST(Objective, DeclareUnifiedTest(QuantileIntercept)) {
   MetaInfo info;
   info.num_row_ = 10;
   info.labels.ModifyInplace([&](HostDeviceVector<float>* data, common::Span<std::size_t> shape) {
-    data->SetDevice(ctx.gpu_id);
+    data->SetDevice(ctx.Device());
     data->Resize(info.num_row_);
     shape[0] = info.num_row_;
     shape[1] = 1;

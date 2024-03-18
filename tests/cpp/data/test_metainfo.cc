@@ -1,6 +1,9 @@
-// Copyright 2016-2021 by Contributors
+/**
+ * Copyright 2016-2024, XGBoost contributors
+ */
 #include "test_metainfo.h"
 
+#include <gmock/gmock.h>
 #include <dmlc/io.h>
 #include <xgboost/data.h>
 
@@ -9,9 +12,10 @@
 
 #include "../../../src/common/version.h"
 #include "../filesystem.h"  // dmlc::TemporaryDirectory
-#include "../helpers.h"
+#include "../helpers.h"     // for GMockTHrow
 #include "xgboost/base.h"
 
+namespace xgboost {
 TEST(MetaInfo, GetSet) {
   xgboost::Context ctx;
   xgboost::MetaInfo info;
@@ -45,6 +49,8 @@ TEST(MetaInfo, GetSet) {
 
 TEST(MetaInfo, GetSetFeature) {
   xgboost::MetaInfo info;
+  ASSERT_THAT([&] { info.SetFeatureInfo("", nullptr, 0); },
+              GMockThrow("Unknown feature info name"));
   EXPECT_THROW(info.SetFeatureInfo("", nullptr, 0), dmlc::Error);
   EXPECT_THROW(info.SetFeatureInfo("foo", nullptr, 0), dmlc::Error);
   EXPECT_NO_THROW(info.SetFeatureInfo("feature_name", nullptr, 0));
@@ -71,6 +77,51 @@ TEST(MetaInfo, GetSetFeature) {
   ASSERT_EQ(info.feature_type_names.size(), 0);
   ASSERT_EQ(info.feature_types.Size(), 0);
   // Other conditions are tested in `SaveLoadBinary`.
+}
+
+namespace {
+void VerifyGetSetFeatureColumnSplit() {
+  xgboost::MetaInfo info;
+  info.data_split_mode = DataSplitMode::kCol;
+  auto const world_size = collective::GetWorldSize();
+
+  auto constexpr kCols{2};
+  std::vector<std::string> types{u8"float", u8"c"};
+  std::vector<char const *> c_types(kCols);
+  std::transform(types.cbegin(), types.cend(), c_types.begin(),
+                 [](auto const &str) { return str.c_str(); });
+  info.num_col_ = kCols;
+  ASSERT_THAT([&] { info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size()); },
+              GMockThrow("Length of feature_type must be equal to number of columns"));
+  info.num_col_ = kCols * world_size;
+  EXPECT_NO_THROW(info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size()));
+  std::vector<std::string> expected_type_names{u8"float", u8"c",     u8"float",
+                                               u8"c",     u8"float", u8"c"};
+  EXPECT_EQ(info.feature_type_names, expected_type_names);
+  std::vector<xgboost::FeatureType> expected_types{
+      xgboost::FeatureType::kNumerical, xgboost::FeatureType::kCategorical,
+      xgboost::FeatureType::kNumerical, xgboost::FeatureType::kCategorical,
+      xgboost::FeatureType::kNumerical, xgboost::FeatureType::kCategorical};
+  EXPECT_EQ(info.feature_types.HostVector(), expected_types);
+
+  std::vector<std::string> names{u8"feature0", u8"feature1"};
+  std::vector<char const *> c_names(kCols);
+  std::transform(names.cbegin(), names.cend(), c_names.begin(),
+                 [](auto const &str) { return str.c_str(); });
+  info.num_col_ = kCols;
+  ASSERT_THAT([&] { info.SetFeatureInfo(u8"feature_name", c_names.data(), c_names.size()); },
+              GMockThrow("Length of feature_name must be equal to number of columns"));
+  info.num_col_ = kCols * world_size;
+  EXPECT_NO_THROW(info.SetFeatureInfo(u8"feature_name", c_names.data(), c_names.size()));
+  std::vector<std::string> expected_names{u8"0.feature0", u8"0.feature1", u8"1.feature0",
+                                          u8"1.feature1", u8"2.feature0", u8"2.feature1"};
+  EXPECT_EQ(info.feature_names, expected_names);
+}
+}  // anonymous namespace
+
+TEST(MetaInfo, GetSetFeatureColumnSplit) {
+  auto constexpr kWorldSize{3};
+  RunWithInMemoryCommunicator(kWorldSize, VerifyGetSetFeatureColumnSplit);
 }
 
 TEST(MetaInfo, SaveLoadBinary) {
@@ -129,8 +180,8 @@ TEST(MetaInfo, SaveLoadBinary) {
     EXPECT_EQ(inforead.group_ptr_, info.group_ptr_);
     EXPECT_EQ(inforead.weights_.HostVector(), info.weights_.HostVector());
 
-    auto orig_margin = info.base_margin_.View(xgboost::Context::kCpuId);
-    auto read_margin = inforead.base_margin_.View(xgboost::Context::kCpuId);
+    auto orig_margin = info.base_margin_.View(xgboost::DeviceOrd::CPU());
+    auto read_margin = inforead.base_margin_.View(xgboost::DeviceOrd::CPU());
     EXPECT_TRUE(std::equal(orig_margin.Values().cbegin(), orig_margin.Values().cend(),
                            read_margin.Values().cbegin()));
 
@@ -180,7 +231,7 @@ TEST(MetaInfo, LoadQid) {
   const std::vector<xgboost::bst_uint> expected_group_ptr{0, 4, 8, 12};
   CHECK(info.group_ptr_ == expected_group_ptr);
 
-  const std::vector<xgboost::bst_row_t> expected_offset{
+  const std::vector<xgboost::bst_idx_t> expected_offset{
     0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60
   };
   const std::vector<xgboost::Entry> expected_data{
@@ -236,9 +287,9 @@ TEST(MetaInfo, Validate) {
   info.num_nonzero_ = 12;
   info.num_col_ = 3;
   std::vector<xgboost::bst_group_t> groups (11);
-  xgboost::Context ctx;
+  Context ctx;
   info.SetInfo(ctx, "group", groups.data(), xgboost::DataType::kUInt32, 11);
-  EXPECT_THROW(info.Validate(0), dmlc::Error);
+  EXPECT_THROW(info.Validate(FstCU()), dmlc::Error);
 
   std::vector<float> labels(info.num_row_ + 1);
   EXPECT_THROW(
@@ -261,14 +312,14 @@ TEST(MetaInfo, Validate) {
   info.group_ptr_.clear();
   labels.resize(info.num_row_);
   info.SetInfo(ctx, "label", labels.data(), xgboost::DataType::kFloat32, info.num_row_);
-  info.labels.SetDevice(0);
-  EXPECT_THROW(info.Validate(1), dmlc::Error);
+  info.labels.SetDevice(FstCU());
+  EXPECT_THROW(info.Validate(DeviceOrd::CUDA(1)), dmlc::Error);
 
   xgboost::HostDeviceVector<xgboost::bst_group_t> d_groups{groups};
-  d_groups.SetDevice(0);
+  d_groups.SetDevice(FstCU());
   d_groups.DevicePointer();  // pull to device
-  std::string arr_interface_str{ArrayInterfaceStr(
-      xgboost::linalg::MakeVec(d_groups.ConstDevicePointer(), d_groups.Size(), 0))};
+  std::string arr_interface_str{ArrayInterfaceStr(xgboost::linalg::MakeVec(
+      d_groups.ConstDevicePointer(), d_groups.Size(), xgboost::DeviceOrd::CUDA(0)))};
   EXPECT_THROW(info.SetInfo(ctx, "group", xgboost::StringView{arr_interface_str}), dmlc::Error);
 #endif  // defined(XGBOOST_USE_CUDA)
 }
@@ -306,6 +357,5 @@ TEST(MetaInfo, HostExtend) {
   }
 }
 
-namespace xgboost {
-TEST(MetaInfo, CPUStridedData) { TestMetaInfoStridedData(Context::kCpuId); }
+TEST(MetaInfo, CPUStridedData) { TestMetaInfoStridedData(DeviceOrd::CPU()); }
 }  // namespace xgboost

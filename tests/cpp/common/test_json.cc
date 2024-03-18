@@ -1,13 +1,15 @@
 /**
- * Copyright (c) 2019-2023, XGBoost Contributors
+ * Copyright 2019-2024, XGBoost Contributors
  */
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <iterator>  // for back_inserter
 #include <map>
 
 #include "../../../src/common/charconv.h"
 #include "../../../src/common/io.h"
+#include "../../../src/common/json_utils.h"
 #include "../../../src/common/threading_utils.h"  // for ParallelFor
 #include "../filesystem.h"                        // dmlc::TemporaryDirectory
 #include "../helpers.h"
@@ -41,7 +43,6 @@ std::string GetModelStr() {
     "num_class": "0",
     "num_feature": "10",
     "objective": "reg:linear",
-    "predictor": "gpu_predictor",
     "tree_method": "gpu_hist",
     "updater": "grow_gpu_hist"
   },
@@ -419,7 +420,7 @@ TEST(Json, AssigningString) {
 
 TEST(Json, LoadDump) {
   std::string ori_buffer = GetModelStr();
-  Json origin {Json::Load(StringView{ori_buffer.c_str(), ori_buffer.size()})};
+  Json origin{Json::Load(StringView{ori_buffer.c_str(), ori_buffer.size()})};
 
   dmlc::TemporaryDirectory tempdir;
   auto const& path = tempdir.path + "test_model_dump";
@@ -431,9 +432,9 @@ TEST(Json, LoadDump) {
   ASSERT_TRUE(fout);
   fout << out << std::flush;
 
-  std::string new_buffer = common::LoadSequentialFile(path);
+  std::vector<char> new_buffer = common::LoadSequentialFile(path);
 
-  Json load_back {Json::Load(StringView(new_buffer.c_str(), new_buffer.size()))};
+  Json load_back{Json::Load(StringView(new_buffer.data(), new_buffer.size()))};
   ASSERT_EQ(load_back, origin);
 }
 
@@ -638,6 +639,40 @@ TEST(Json, TypedArray) {
       ASSERT_EQ(arr[i + 8], i);
     }
   }
+
+  {
+    Json f64{Object{}};
+    auto array = F64Array();
+    auto& vec = array.GetArray();
+    // Construct test data
+    vec.resize(18);
+    std::iota(vec.begin(), vec.end(), 0.0);
+    // special values
+    vec.push_back(std::numeric_limits<double>::epsilon());
+    vec.push_back(std::numeric_limits<double>::max());
+    vec.push_back(std::numeric_limits<double>::min());
+    vec.push_back(std::numeric_limits<double>::denorm_min());
+    vec.push_back(std::numeric_limits<double>::quiet_NaN());
+
+    static_assert(
+        std::is_same_v<double, typename std::remove_reference_t<decltype(vec)>::value_type>);
+
+    f64["f64"] = std::move(array);
+    ASSERT_TRUE(IsA<F64Array>(f64["f64"]));
+    std::vector<char> out;
+    Json::Dump(f64, &out, std::ios::binary);
+
+    auto loaded = Json::Load(StringView{out.data(), out.size()}, std::ios::binary);
+    ASSERT_TRUE(IsA<F64Array>(loaded["f64"]));
+    auto const& result = get<F64Array const>(loaded["f64"]);
+
+    auto& vec1 = get<F64Array const>(f64["f64"]);
+    ASSERT_EQ(result.size(), vec1.size());
+    for (std::size_t i = 0; i < vec1.size() - 1; ++i) {
+      ASSERT_EQ(result[i], vec1[i]);
+    }
+    ASSERT_TRUE(std::isnan(result.back()));
+  }
 }
 
 TEST(UBJson, Basic) {
@@ -652,7 +687,7 @@ TEST(UBJson, Basic) {
     }
 
     auto data = common::LoadSequentialFile("test.ubj");
-    UBJReader reader{StringView{data}};
+    UBJReader reader{StringView{data.data(), data.size()}};
     json = reader.Load();
     return json;
   };
@@ -676,7 +711,23 @@ TEST(UBJson, Basic) {
     ASSERT_FLOAT_EQ(3.14, get<Number>(get<Array>(ret["test"])[1]));
     ASSERT_FLOAT_EQ(2.71, get<Number>(get<Array>(ret["test"])[0]));
   }
+  {
+    // boolean
+    Json boolean{Object{}};
+    boolean["foo"] = Boolean{false};
+    std::vector<char> out;
+    Json::Dump(boolean, &out, std::ios::binary);
+    auto loaded = Json::Load(StringView{out.data(), out.size()}, std::ios::binary);
+
+    ASSERT_EQ(boolean, loaded);
+
+    boolean["foo"] = Boolean{true};
+    Json::Dump(boolean, &out, std::ios::binary);
+    loaded = Json::Load(StringView{out.data(), out.size()}, std::ios::binary);
+    ASSERT_EQ(boolean, loaded);
+  }
 }
+
 
 TEST(Json, TypeCheck) {
   Json config{Object{}};
@@ -690,6 +741,18 @@ TEST(Json, TypeCheck) {
     ASSERT_NE(err.find("Number"), std::string::npos);
     ASSERT_NE(err.find("I32Array"), std::string::npos);
     ASSERT_NE(err.find("foo"), std::string::npos);
+  }
+}
+
+TEST(Json, Dump) {
+  auto str = GetModelStr();
+  auto jobj = Json::Load(str);
+  std::string result_s = Json::Dump(jobj);
+
+  std::vector<char> result_v = Json::Dump<std::vector<char>>(jobj);
+  ASSERT_EQ(result_s.size(), result_v.size());
+  for (std::size_t i = 0; i < result_s.size(); ++i) {
+    ASSERT_EQ(result_s[i], result_v[i]);
   }
 }
 }  // namespace xgboost

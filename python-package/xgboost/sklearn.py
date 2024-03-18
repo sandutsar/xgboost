@@ -5,12 +5,14 @@ import json
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from inspect import signature
 from typing import (
     Any,
     Callable,
     Dict,
     List,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
     Type,
@@ -22,7 +24,7 @@ from typing import (
 import numpy as np
 from scipy.special import softmax
 
-from ._typing import ArrayLike, FeatureNames, FeatureTypes, ModelIn
+from ._typing import ArrayLike, FeatureNames, FeatureTypes, IterationRange, ModelIn
 from .callback import TrainingCallback
 
 # Do not use class names on scikit-learn directly.  Re-define the classes on
@@ -39,21 +41,8 @@ from .core import (
     _deprecate_positional_args,
     _parse_eval_str,
 )
-from .data import _is_cudf_df, _is_cudf_ser, _is_cupy_array, _is_pandas_df
+from .data import _is_cudf_df, _is_cudf_ser, _is_cupy_alike, _is_pandas_df
 from .training import train
-
-
-class XGBClassifierMixIn:  # pylint: disable=too-few-public-methods
-    """MixIn for classification."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-
-    def _load_model_attributes(self, booster: Booster) -> None:
-        config = json.loads(booster.save_config())
-        self.n_classes_ = int(config["learner"]["learner_model_param"]["num_class"])
-        # binary classification is treated as regression in XGBoost.
-        self.n_classes_ = 2 if self.n_classes_ < 2 else self.n_classes_
 
 
 class XGBRankerMixIn:  # pylint: disable=too-few-public-methods
@@ -76,14 +65,24 @@ def _check_rf_callback(
         )
 
 
-SklObjective = Optional[
-    Union[str, Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]
-]
+def _can_use_qdm(tree_method: Optional[str]) -> bool:
+    return tree_method in ("hist", "gpu_hist", None, "auto")
 
 
-def _objective_decorator(
-    func: Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]
-) -> Objective:
+class _SklObjWProto(Protocol):  # pylint: disable=too-few-public-methods
+    def __call__(
+        self,
+        y_true: ArrayLike,
+        y_pred: ArrayLike,
+        sample_weight: Optional[ArrayLike],
+    ) -> Tuple[ArrayLike, ArrayLike]: ...
+
+
+_SklObjProto = Callable[[ArrayLike, ArrayLike], Tuple[np.ndarray, np.ndarray]]
+SklObjective = Optional[Union[str, _SklObjWProto, _SklObjProto]]
+
+
+def _objective_decorator(func: Union[_SklObjWProto, _SklObjProto]) -> Objective:
     """Decorate an objective function
 
     Converts an objective function using the typical sklearn metrics
@@ -98,6 +97,8 @@ def _objective_decorator(
             The target values
         y_pred: array_like of shape [n_samples]
             The predicted values
+        sample_weight :
+            Optional sample weight, None or a ndarray.
 
     Returns
     -------
@@ -112,10 +113,25 @@ def _objective_decorator(
             ``dmatrix.get_label()``
     """
 
+    parameters = signature(func).parameters
+    supports_sw = "sample_weight" in parameters
+
     def inner(preds: np.ndarray, dmatrix: DMatrix) -> Tuple[np.ndarray, np.ndarray]:
-        """internal function"""
+        """Internal function."""
+        sample_weight = dmatrix.get_weight()
         labels = dmatrix.get_label()
-        return func(labels, preds)
+
+        if sample_weight.size > 0 and not supports_sw:
+            raise ValueError(
+                "Custom objective doesn't have the `sample_weight` parameter while"
+                " sample_weight is used."
+            )
+        if sample_weight.size > 0:
+            fnw = cast(_SklObjWProto, func)
+            return fnw(labels, preds, sample_weight=sample_weight)
+
+        fn = cast(_SklObjProto, func)
+        return fn(labels, preds)
 
     return inner
 
@@ -181,70 +197,121 @@ def ltr_metric_decorator(func: Callable, n_jobs: Optional[int]) -> Metric:
     return inner
 
 
-__estimator_doc = """
-    n_estimators : Optional[int]
+__estimator_doc = f"""
+    n_estimators : {Optional[int]}
         Number of gradient boosted trees.  Equivalent to number of boosting
         rounds.
 """
 
 __model_doc = f"""
-    max_depth :  Optional[int]
+    max_depth :  {Optional[int]}
+
         Maximum tree depth for base learners.
-    max_leaves :
+
+    max_leaves : {Optional[int]}
+
         Maximum number of leaves; 0 indicates no limit.
-    max_bin :
+
+    max_bin : {Optional[int]}
+
         If using histogram-based algorithm, maximum number of bins per feature
-    grow_policy :
-        Tree growing policy. 0: favor splitting at nodes closest to the node, i.e. grow
-        depth-wise. 1: favor splitting at nodes with highest loss change.
-    learning_rate : Optional[float]
+
+    grow_policy : {Optional[str]}
+
+        Tree growing policy.
+
+        - depthwise: Favors splitting at nodes closest to the node,
+        - lossguide: Favors splitting at nodes with highest loss change.
+
+    learning_rate : {Optional[float]}
+
         Boosting learning rate (xgb's "eta")
-    verbosity : Optional[int]
+
+    verbosity : {Optional[int]}
+
         The degree of verbosity. Valid values are 0 (silent) - 3 (debug).
+
     objective : {SklObjective}
-        Specify the learning task and the corresponding learning objective or
-        a custom objective function to be used (see note below).
-    booster: Optional[str]
-        Specify which booster to use: gbtree, gblinear or dart.
-    tree_method: Optional[str]
+
+        Specify the learning task and the corresponding learning objective or a custom
+        objective function to be used.
+
+        For custom objective, see :doc:`/tutorials/custom_metric_obj` and
+        :ref:`custom-obj-metric` for more information, along with the end note for
+        function signatures.
+
+    booster: {Optional[str]}
+
+        Specify which booster to use: ``gbtree``, ``gblinear`` or ``dart``.
+
+    tree_method : {Optional[str]}
+
         Specify which tree method to use.  Default to auto.  If this parameter is set to
         default, XGBoost will choose the most conservative option available.  It's
         recommended to study this option from the parameters document :doc:`tree method
         </treemethod>`
-    n_jobs : Optional[int]
+
+    n_jobs : {Optional[int]}
+
         Number of parallel threads used to run xgboost.  When used with other
         Scikit-Learn algorithms like grid search, you may choose which algorithm to
         parallelize and balance the threads.  Creating thread contention will
         significantly slow down both algorithms.
-    gamma : Optional[float]
-        (min_split_loss) Minimum loss reduction required to make a further partition on a
-        leaf node of the tree.
-    min_child_weight : Optional[float]
+
+    gamma : {Optional[float]}
+
+        (min_split_loss) Minimum loss reduction required to make a further partition on
+        a leaf node of the tree.
+
+    min_child_weight : {Optional[float]}
+
         Minimum sum of instance weight(hessian) needed in a child.
-    max_delta_step : Optional[float]
+
+    max_delta_step : {Optional[float]}
+
         Maximum delta step we allow each tree's weight estimation to be.
-    subsample : Optional[float]
+
+    subsample : {Optional[float]}
+
         Subsample ratio of the training instance.
-    sampling_method :
-        Sampling method. Used only by `gpu_hist` tree method.
-          - `uniform`: select random training instances uniformly.
-          - `gradient_based` select random training instances with higher probability when
-            the gradient and hessian are larger. (cf. CatBoost)
-    colsample_bytree : Optional[float]
+
+    sampling_method : {Optional[str]}
+
+        Sampling method. Used only by the GPU version of ``hist`` tree method.
+
+        - ``uniform``: Select random training instances uniformly.
+        - ``gradient_based``: Select random training instances with higher probability
+            when the gradient and hessian are larger. (cf. CatBoost)
+
+    colsample_bytree : {Optional[float]}
+
         Subsample ratio of columns when constructing each tree.
-    colsample_bylevel : Optional[float]
+
+    colsample_bylevel : {Optional[float]}
+
         Subsample ratio of columns for each level.
-    colsample_bynode : Optional[float]
+
+    colsample_bynode : {Optional[float]}
+
         Subsample ratio of columns for each split.
-    reg_alpha : Optional[float]
+
+    reg_alpha : {Optional[float]}
+
         L1 regularization term on weights (xgb's alpha).
-    reg_lambda : Optional[float]
+
+    reg_lambda : {Optional[float]}
+
         L2 regularization term on weights (xgb's lambda).
-    scale_pos_weight : Optional[float]
+
+    scale_pos_weight : {Optional[float]}
         Balancing of positive and negative weights.
-    base_score : Optional[float]
+
+    base_score : {Optional[float]}
+
         The initial prediction score of all instances, global bias.
-    random_state : Optional[Union[numpy.random.RandomState, int]]
+
+    random_state : {Optional[Union[np.random.RandomState, np.random.Generator, int]]}
+
         Random number seed.
 
         .. note::
@@ -252,52 +319,59 @@ __model_doc = f"""
            Using gblinear booster with shotgun updater is nondeterministic as
            it uses Hogwild algorithm.
 
-    missing : float, default np.nan
-        Value in the data which needs to be present as a missing value.
-    num_parallel_tree: Optional[int]
+    missing : float
+
+        Value in the data which needs to be present as a missing value. Default to
+        :py:data:`numpy.nan`.
+
+    num_parallel_tree: {Optional[int]}
+
         Used for boosting random forest.
-    monotone_constraints : Optional[Union[Dict[str, int], str]]
+
+    monotone_constraints : {Optional[Union[Dict[str, int], str]]}
+
         Constraint of variable monotonicity.  See :doc:`tutorial </tutorials/monotonic>`
         for more information.
-    interaction_constraints : Optional[Union[str, List[Tuple[str]]]]
+
+    interaction_constraints : {Optional[Union[str, List[Tuple[str]]]]}
+
         Constraints for interaction representing permitted interactions.  The
         constraints must be specified in the form of a nested list, e.g. ``[[0, 1], [2,
         3, 4]]``, where each inner list is a group of indices of features that are
         allowed to interact with each other.  See :doc:`tutorial
         </tutorials/feature_interaction_constraint>` for more information
-    importance_type: Optional[str]
+
+    importance_type: {Optional[str]}
+
         The feature importance type for the feature_importances\\_ property:
 
         * For tree model, it's either "gain", "weight", "cover", "total_gain" or
           "total_cover".
-        * For linear model, only "weight" is defined and it's the normalized coefficients
-          without bias.
+        * For linear model, only "weight" is defined and it's the normalized
+          coefficients without bias.
 
-    gpu_id : Optional[int]
-        Device ordinal.
-    validate_parameters : Optional[bool]
+    device : {Optional[str]}
+
+        .. versionadded:: 2.0.0
+
+        Device ordinal, available options are `cpu`, `cuda`, and `gpu`.
+
+    validate_parameters : {Optional[bool]}
+
         Give warnings for unknown parameter.
-    predictor : Optional[str]
-        Force XGBoost to use specific predictor, available choices are [cpu_predictor,
-        gpu_predictor].
+
     enable_categorical : bool
 
-        .. versionadded:: 1.5.0
+        See the same parameter of :py:class:`DMatrix` for details.
 
-        .. note:: This parameter is experimental
-
-        Experimental support for categorical data.  When enabled, cudf/pandas.DataFrame
-        should be used to specify categorical data type.  Also, JSON/UBJSON
-        serialization format is required.
-
-    feature_types : Optional[FeatureTypes]
+    feature_types : {Optional[FeatureTypes]}
 
         .. versionadded:: 1.7.0
 
         Used for specifying feature types without constructing a dataframe. See
         :py:class:`DMatrix` for details.
 
-    max_cat_to_onehot : Optional[int]
+    max_cat_to_onehot : {Optional[int]}
 
         .. versionadded:: 1.6.0
 
@@ -310,7 +384,7 @@ __model_doc = f"""
         categorical feature support. See :doc:`Categorical Data
         </tutorials/categorical>` and :ref:`cat-param` for details.
 
-    max_cat_threshold : Optional[int]
+    max_cat_threshold : {Optional[int]}
 
         .. versionadded:: 1.7.0
 
@@ -321,7 +395,7 @@ __model_doc = f"""
         needs to be set to have categorical feature support. See :doc:`Categorical Data
         </tutorials/categorical>` and :ref:`cat-param` for details.
 
-    multi_strategy : Optional[str]
+    multi_strategy : {Optional[str]}
 
         .. versionadded:: 2.0.0
 
@@ -334,33 +408,27 @@ __model_doc = f"""
         - ``one_output_per_tree``: One model for each target.
         - ``multi_output_tree``:  Use multi-target trees.
 
-    eval_metric : Optional[Union[str, List[str], Callable]]
+    eval_metric : {Optional[Union[str, List[str], Callable]]}
 
         .. versionadded:: 1.6.0
 
         Metric used for monitoring the training result and early stopping.  It can be a
         string or list of strings as names of predefined metric in XGBoost (See
-        doc/parameter.rst), one of the metrics in :py:mod:`sklearn.metrics`, or any other
-        user defined metric that looks like `sklearn.metrics`.
+        doc/parameter.rst), one of the metrics in :py:mod:`sklearn.metrics`, or any
+        other user defined metric that looks like `sklearn.metrics`.
 
         If custom objective is also provided, then custom metric should implement the
         corresponding reverse link function.
 
         Unlike the `scoring` parameter commonly used in scikit-learn, when a callable
-        object is provided, it's assumed to be a cost function and by default XGBoost will
-        minimize the result during early stopping.
+        object is provided, it's assumed to be a cost function and by default XGBoost
+        will minimize the result during early stopping.
 
-        For advanced usage on Early stopping like directly choosing to maximize instead of
-        minimize, see :py:obj:`xgboost.callback.EarlyStopping`.
+        For advanced usage on Early stopping like directly choosing to maximize instead
+        of minimize, see :py:obj:`xgboost.callback.EarlyStopping`.
 
-        See :doc:`Custom Objective and Evaluation Metric </tutorials/custom_metric_obj>`
-        for more.
-
-        .. note::
-
-             This parameter replaces `eval_metric` in :py:meth:`fit` method.  The old
-             one receives un-transformed prediction regardless of whether custom
-             objective is being used.
+        See :doc:`/tutorials/custom_metric_obj` and :ref:`custom-obj-metric` for more
+        information.
 
         .. code-block:: python
 
@@ -373,7 +441,7 @@ __model_doc = f"""
             )
             reg.fit(X, y, eval_set=[(X, y)])
 
-    early_stopping_rounds : Optional[int]
+    early_stopping_rounds : {Optional[int]}
 
         .. versionadded:: 1.6.0
 
@@ -381,22 +449,23 @@ __model_doc = f"""
           every **early_stopping_rounds** round(s) to continue training.  Requires at
           least one item in **eval_set** in :py:meth:`fit`.
 
-        - The method returns the model from the last iteration, not the best one, use a
-          callback :py:class:`xgboost.callback.EarlyStopping` if returning the best
-          model is preferred.
+        - If early stopping occurs, the model will have two additional attributes:
+          :py:attr:`best_score` and :py:attr:`best_iteration`. These are used by the
+          :py:meth:`predict` and :py:meth:`apply` methods to determine the optimal
+          number of trees during inference. If users want to access the full model
+          (including trees built after early stopping), they can specify the
+          `iteration_range` in these inference methods. In addition, other utilities
+          like model plotting can also use the entire model.
+
+        - If you prefer to discard the trees after `best_iteration`, consider using the
+          callback function :py:class:`xgboost.callback.EarlyStopping`.
 
         - If there's more than one item in **eval_set**, the last entry will be used for
           early stopping.  If there's more than one metric in **eval_metric**, the last
           metric will be used for early stopping.
 
-        - If early stopping occurs, the model will have three additional fields:
-          :py:attr:`best_score`, :py:attr:`best_iteration`.
+    callbacks : {Optional[List[TrainingCallback]]}
 
-        .. note::
-
-            This parameter replaces `early_stopping_rounds` in :py:meth:`fit` method.
-
-    callbacks : Optional[List[TrainingCallback]]
         List of callback functions that are applied at end of each iteration.
         It is possible to use predefined callbacks by using
         :ref:`Callback API <callback_api>`.
@@ -415,7 +484,8 @@ __model_doc = f"""
                 reg = xgboost.XGBRegressor(**params, callbacks=callbacks)
                 reg.fit(X, y)
 
-    kwargs : dict, optional
+    kwargs : {Optional[Any]}
+
         Keyword arguments for XGBoost Booster object.  Full documentation of parameters
         can be found :doc:`here </parameter>`.
         Attempting to set a parameter via the constructor args and \\*\\*kwargs
@@ -432,13 +502,16 @@ __custom_obj_note = """
         .. note::  Custom objective function
 
             A custom objective function can be provided for the ``objective``
-            parameter. In this case, it should have the signature
-            ``objective(y_true, y_pred) -> grad, hess``:
+            parameter. In this case, it should have the signature ``objective(y_true,
+            y_pred) -> [grad, hess]`` or ``objective(y_true, y_pred, *, sample_weight)
+            -> [grad, hess]``:
 
             y_true: array_like of shape [n_samples]
                 The target values
             y_pred: array_like of shape [n_samples]
                 The predicted values
+            sample_weight :
+                Optional sample weights.
 
             grad: array_like of shape [n_samples]
                 The value of the gradient for each sample point.
@@ -640,15 +713,16 @@ class XGBModel(XGBModelBase):
         reg_lambda: Optional[float] = None,
         scale_pos_weight: Optional[float] = None,
         base_score: Optional[float] = None,
-        random_state: Optional[Union[np.random.RandomState, int]] = None,
+        random_state: Optional[
+            Union[np.random.RandomState, np.random.Generator, int]
+        ] = None,
         missing: float = np.nan,
         num_parallel_tree: Optional[int] = None,
         monotone_constraints: Optional[Union[Dict[str, int], str]] = None,
         interaction_constraints: Optional[Union[str, Sequence[Sequence[str]]]] = None,
         importance_type: Optional[str] = None,
-        gpu_id: Optional[int] = None,
+        device: Optional[str] = None,
         validate_parameters: Optional[bool] = None,
-        predictor: Optional[str] = None,
         enable_categorical: bool = False,
         feature_types: Optional[FeatureTypes] = None,
         max_cat_to_onehot: Optional[int] = None,
@@ -693,9 +767,8 @@ class XGBModel(XGBModelBase):
         self.monotone_constraints = monotone_constraints
         self.interaction_constraints = interaction_constraints
         self.importance_type = importance_type
-        self.gpu_id = gpu_id
+        self.device = device
         self.validate_parameters = validate_parameters
-        self.predictor = predictor
         self.enable_categorical = enable_categorical
         self.feature_types = feature_types
         self.max_cat_to_onehot = max_cat_to_onehot
@@ -780,6 +853,10 @@ class XGBModel(XGBModelBase):
             params["random_state"] = params["random_state"].randint(
                 np.iinfo(np.int32).max
             )
+        elif isinstance(params["random_state"], np.random.Generator):
+            params["random_state"] = int(
+                params["random_state"].integers(np.iinfo(np.int32).max)
+            )
 
         return params
 
@@ -793,7 +870,6 @@ class XGBModel(XGBModelBase):
             "kwargs",
             "missing",
             "n_estimators",
-            "use_label_encoder",
             "enable_categorical",
             "early_stopping_rounds",
             "callbacks",
@@ -836,35 +912,47 @@ class XGBModel(XGBModelBase):
         self.get_booster().load_model(fname)
 
         meta_str = self.get_booster().attr("scikit_learn")
-        if meta_str is None:
-            return
+        if meta_str is not None:
+            meta = json.loads(meta_str)
+            t = meta.get("_estimator_type", None)
+            if t is not None and t != self._get_type():
+                raise TypeError(
+                    "Loading an estimator with different type. Expecting: "
+                    f"{self._get_type()}, got: {t}"
+                )
 
-        meta = json.loads(meta_str)
-        t = meta.get("_estimator_type", None)
-        if t is not None and t != self._get_type():
-            raise TypeError(
-                "Loading an estimator with different type. Expecting: "
-                f"{self._get_type()}, got: {t}"
-            )
         self.feature_types = self.get_booster().feature_types
         self.get_booster().set_attr(scikit_learn=None)
+        config = json.loads(self.get_booster().save_config())
+        self._load_model_attributes(config)
 
     load_model.__doc__ = f"""{Booster.load_model.__doc__}"""
+
+    def _load_model_attributes(self, config: dict) -> None:
+        """Load model attributes without hyper-parameters."""
+        from sklearn.base import is_classifier
+
+        booster = self.get_booster()
+
+        self.objective = config["learner"]["objective"]["name"]
+        self.booster = config["learner"]["gradient_booster"]["name"]
+        self.base_score = config["learner"]["learner_model_param"]["base_score"]
+        self.feature_types = booster.feature_types
+
+        if is_classifier(self):
+            self.n_classes_ = int(config["learner"]["learner_model_param"]["num_class"])
+            # binary classification is treated as regression in XGBoost.
+            self.n_classes_ = 2 if self.n_classes_ < 2 else self.n_classes_
 
     # pylint: disable=too-many-branches
     def _configure_fit(
         self,
         booster: Optional[Union[Booster, "XGBModel", str]],
-        eval_metric: Optional[Union[Callable, str, Sequence[str]]],
         params: Dict[str, Any],
-        early_stopping_rounds: Optional[int],
-        callbacks: Optional[Sequence[TrainingCallback]],
     ) -> Tuple[
         Optional[Union[Booster, str, "XGBModel"]],
         Optional[Metric],
         Dict[str, Any],
-        Optional[int],
-        Optional[Sequence[TrainingCallback]],
     ]:
         """Configure parameters for :py:meth:`fit`."""
         if isinstance(booster, XGBModel):
@@ -886,62 +974,28 @@ class XGBModel(XGBModelBase):
                 "or `set_params` instead."
             )
 
-        # Configure evaluation metric.
-        if eval_metric is not None:
-            _deprecated("eval_metric")
-        if self.eval_metric is not None and eval_metric is not None:
-            _duplicated("eval_metric")
-        # - track where does the evaluation metric come from
-        if self.eval_metric is not None:
-            from_fit = False
-            eval_metric = self.eval_metric
-        else:
-            from_fit = True
         # - configure callable evaluation metric
         metric: Optional[Metric] = None
-        if eval_metric is not None:
-            if callable(eval_metric) and from_fit:
-                # No need to wrap the evaluation function for old parameter.
-                metric = eval_metric
-            elif callable(eval_metric):
-                # Parameter from constructor or set_params
+        if self.eval_metric is not None:
+            if callable(self.eval_metric):
                 if self._get_type() == "ranker":
-                    metric = ltr_metric_decorator(eval_metric, self.n_jobs)
+                    metric = ltr_metric_decorator(self.eval_metric, self.n_jobs)
                 else:
-                    metric = _metric_decorator(eval_metric)
+                    metric = _metric_decorator(self.eval_metric)
             else:
-                params.update({"eval_metric": eval_metric})
-
-        # Configure early_stopping_rounds
-        if early_stopping_rounds is not None:
-            _deprecated("early_stopping_rounds")
-        if early_stopping_rounds is not None and self.early_stopping_rounds is not None:
-            _duplicated("early_stopping_rounds")
-        early_stopping_rounds = (
-            self.early_stopping_rounds
-            if self.early_stopping_rounds is not None
-            else early_stopping_rounds
-        )
-
-        # Configure callbacks
-        if callbacks is not None:
-            _deprecated("callbacks")
-        if callbacks is not None and self.callbacks is not None:
-            _duplicated("callbacks")
-        callbacks = self.callbacks if self.callbacks is not None else callbacks
+                params.update({"eval_metric": self.eval_metric})
 
         tree_method = params.get("tree_method", None)
-        cat_support = {"gpu_hist", "approx", "hist"}
-        if self.enable_categorical and tree_method not in cat_support:
+        if self.enable_categorical and tree_method == "exact":
             raise ValueError(
                 "Experimental support for categorical data is not implemented for"
                 " current tree method yet."
             )
-        return model, metric, params, early_stopping_rounds, callbacks
+        return model, metric, params
 
     def _create_dmatrix(self, ref: Optional[DMatrix], **kwargs: Any) -> DMatrix:
         # Use `QuantileDMatrix` to save memory.
-        if self.tree_method in ("hist", "gpu_hist"):
+        if _can_use_qdm(self.tree_method) and self.booster != "gblinear":
             try:
                 return QuantileDMatrix(
                     **kwargs, ref=ref, nthread=self.n_jobs, max_bin=self.max_bin
@@ -963,14 +1017,11 @@ class XGBModel(XGBModelBase):
         sample_weight: Optional[ArrayLike] = None,
         base_margin: Optional[ArrayLike] = None,
         eval_set: Optional[Sequence[Tuple[ArrayLike, ArrayLike]]] = None,
-        eval_metric: Optional[Union[str, Sequence[str], Metric]] = None,
-        early_stopping_rounds: Optional[int] = None,
         verbose: Optional[Union[bool, int]] = True,
         xgb_model: Optional[Union[Booster, str, "XGBModel"]] = None,
         sample_weight_eval_set: Optional[Sequence[ArrayLike]] = None,
         base_margin_eval_set: Optional[Sequence[ArrayLike]] = None,
         feature_weights: Optional[ArrayLike] = None,
-        callbacks: Optional[Sequence[TrainingCallback]] = None,
     ) -> "XGBModel":
         # pylint: disable=invalid-name,attribute-defined-outside-init
         """Fit gradient boosting model.
@@ -984,31 +1035,23 @@ class XGBModel(XGBModelBase):
         X :
             Feature matrix. See :ref:`py-data` for a list of supported types.
 
-            When the ``tree_method`` is set to ``hist`` or ``gpu_hist``, internally, the
+            When the ``tree_method`` is set to ``hist``, internally, the
             :py:class:`QuantileDMatrix` will be used instead of the :py:class:`DMatrix`
             for conserving memory. However, this has performance implications when the
             device of input data is not matched with algorithm. For instance, if the
-            input is a numpy array on CPU but ``gpu_hist`` is used for training, then
-            the data is first processed on CPU then transferred to GPU.
+            input is a numpy array on CPU but ``cuda`` is used for training, then the
+            data is first processed on CPU then transferred to GPU.
         y :
             Labels
         sample_weight :
             instance weights
         base_margin :
-            global bias for each instance.
+            Global bias for each instance. See :doc:`/tutorials/intercept` for details.
         eval_set :
             A list of (X, y) tuple pairs to use as validation sets, for which
             metrics will be computed.
             Validation metrics will help us track the performance of the model.
 
-        eval_metric : str, list of str, or callable, optional
-            .. deprecated:: 1.6.0
-                Use `eval_metric` in :py:meth:`__init__` or :py:meth:`set_params` instead.
-
-        early_stopping_rounds : int
-            .. deprecated:: 1.6.0
-                Use `early_stopping_rounds` in :py:meth:`__init__` or
-                :py:meth:`set_params` instead.
         verbose :
             If `verbose` is True and an evaluation set is used, the evaluation metric
             measured on the validation set is printed to stdout at each boosting stage.
@@ -1028,10 +1071,6 @@ class XGBModel(XGBModelBase):
             Weight for each feature, defines the probability of each feature being
             selected when colsample is being used.  All values must be greater than 0,
             otherwise a `ValueError` is thrown.
-
-        callbacks :
-            .. deprecated:: 1.6.0
-                Use `callbacks` in :py:meth:`__init__` or :py:meth:`set_params` instead.
 
         """
         with config_context(verbosity=self.verbosity):
@@ -1062,45 +1101,32 @@ class XGBModel(XGBModelBase):
             else:
                 obj = None
 
-            (
-                model,
-                metric,
-                params,
-                early_stopping_rounds,
-                callbacks,
-            ) = self._configure_fit(
-                xgb_model, eval_metric, params, early_stopping_rounds, callbacks
-            )
+            model, metric, params = self._configure_fit(xgb_model, params)
             self._Booster = train(
                 params,
                 train_dmatrix,
                 self.get_num_boosting_rounds(),
                 evals=evals,
-                early_stopping_rounds=early_stopping_rounds,
+                early_stopping_rounds=self.early_stopping_rounds,
                 evals_result=evals_result,
                 obj=obj,
                 custom_metric=metric,
                 verbose_eval=verbose,
                 xgb_model=model,
-                callbacks=callbacks,
+                callbacks=self.callbacks,
             )
 
             self._set_evaluation_result(evals_result)
             return self
 
     def _can_use_inplace_predict(self) -> bool:
-        # When predictor is explicitly set, using `inplace_predict` might result into
-        # error with incompatible data type.
-        # Inplace predict doesn't handle as many data types as DMatrix, but it's
-        # sufficient for dask interface where input is simpiler.
-        predictor = self.get_xgb_params().get("predictor", None)
-        if predictor in ("auto", None) and self.booster != "gblinear":
+        if self.booster != "gblinear":
             return True
         return False
 
     def _get_iteration_range(
-        self, iteration_range: Optional[Tuple[int, int]]
-    ) -> Tuple[int, int]:
+        self, iteration_range: Optional[IterationRange]
+    ) -> IterationRange:
         if iteration_range is None or iteration_range[1] == 0:
             # Use best_iteration if defined.
             try:
@@ -1117,12 +1143,12 @@ class XGBModel(XGBModelBase):
         output_margin: bool = False,
         validate_features: bool = True,
         base_margin: Optional[ArrayLike] = None,
-        iteration_range: Optional[Tuple[int, int]] = None,
+        iteration_range: Optional[IterationRange] = None,
     ) -> ArrayLike:
         """Predict with `X`.  If the model is trained with early stopping, then
-        :py:attr:`best_iteration` is used automatically.  For tree models, when data is
-        on GPU, like cupy array or cuDF dataframe and `predictor` is not specified, the
-        prediction is run on GPU automatically, otherwise it will run on CPU.
+        :py:attr:`best_iteration` is used automatically. The estimator uses
+        `inplace_predict` by default and falls back to using :py:class:`DMatrix` if
+        devices between the data and the estimator don't match.
 
         .. note:: This function is only thread safe for `gbtree` and `dart`.
 
@@ -1136,7 +1162,7 @@ class XGBModel(XGBModelBase):
             When this is True, validate that the Booster's and data's feature_names are
             identical.  Otherwise, it is assumed that the feature_names are the same.
         base_margin :
-            Margin added to prediction.
+            Global bias for each instance. See :doc:`/tutorials/intercept` for details.
         iteration_range :
             Specifies which layer of trees are used in prediction.  For example, if a
             random forest is trained with 100 rounds.  Specifying ``iteration_range=(10,
@@ -1162,7 +1188,7 @@ class XGBModel(XGBModelBase):
                         base_margin=base_margin,
                         validate_features=validate_features,
                     )
-                    if _is_cupy_array(predts):
+                    if _is_cupy_alike(predts):
                         import cupy  # pylint: disable=import-error
 
                         predts = cupy.asnumpy(predts)  # ensure numpy array is used.
@@ -1189,7 +1215,7 @@ class XGBModel(XGBModelBase):
     def apply(
         self,
         X: ArrayLike,
-        iteration_range: Optional[Tuple[int, int]] = None,
+        iteration_range: Optional[IterationRange] = None,
     ) -> np.ndarray:
         """Return the predicted leaf every tree for each sample. If the model is trained
         with early stopping, then :py:attr:`best_iteration` is used automatically.
@@ -1272,19 +1298,10 @@ class XGBModel(XGBModelBase):
             )
         return np.array(feature_names)
 
-    def _early_stopping_attr(self, attr: str) -> Union[float, int]:
-        booster = self.get_booster()
-        try:
-            return getattr(booster, attr)
-        except AttributeError as e:
-            raise AttributeError(
-                f"`{attr}` in only defined when early stopping is used."
-            ) from e
-
     @property
     def best_score(self) -> float:
         """The best score obtained by early stopping."""
-        return float(self._early_stopping_attr("best_score"))
+        return self.get_booster().best_score
 
     @property
     def best_iteration(self) -> int:
@@ -1292,7 +1309,7 @@ class XGBModel(XGBModelBase):
         for instance if the best iteration is the first round, then best_iteration is 0.
 
         """
-        return int(self._early_stopping_attr("best_iteration"))
+        return self.get_booster().best_iteration
 
     @property
     def feature_importances_(self) -> np.ndarray:
@@ -1361,25 +1378,25 @@ class XGBModel(XGBModelBase):
 
     @property
     def intercept_(self) -> np.ndarray:
-        """
-        Intercept (bias) property
+        """Intercept (bias) property
 
-        .. note:: Intercept is defined only for linear learners
-
-            Intercept (bias) is only defined when the linear model is chosen as base
-            learner (`booster=gblinear`). It is not defined for other base learner types,
-            such as tree learners (`booster=gbtree`).
+        For tree-based model, the returned value is the `base_score`.
 
         Returns
         -------
         intercept_ : array of shape ``(1,)`` or ``[n_classes]``
+
         """
-        if self.get_xgb_params()["booster"] != "gblinear":
-            raise AttributeError(
-                f"Intercept (bias) is not defined for Booster type {self.booster}"
-            )
+        booster_config = self.get_xgb_params()["booster"]
         b = self.get_booster()
-        return np.array(json.loads(b.get_dump(dump_format="json")[0])["bias"])
+        if booster_config != "gblinear":  # gbtree, dart
+            config = json.loads(b.save_config())
+            intercept = config["learner"]["learner_model_param"]["base_score"]
+            return np.array([float(intercept)], dtype=np.float32)
+
+        return np.array(
+            json.loads(b.get_dump(dump_format="json")[0])["bias"], dtype=np.float32
+        )
 
 
 PredtT = TypeVar("PredtT", bound=np.ndarray)
@@ -1411,7 +1428,7 @@ def _cls_predict_proba(n_classes: int, prediction: PredtT, vstack: Callable) -> 
         Number of boosting rounds.
 """,
 )
-class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
+class XGBClassifier(XGBModel, XGBClassifierBase):
     # pylint: disable=missing-docstring,invalid-name,too-many-instance-attributes
     @_deprecate_positional_args
     def __init__(
@@ -1431,14 +1448,11 @@ class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
         sample_weight: Optional[ArrayLike] = None,
         base_margin: Optional[ArrayLike] = None,
         eval_set: Optional[Sequence[Tuple[ArrayLike, ArrayLike]]] = None,
-        eval_metric: Optional[Union[str, Sequence[str], Metric]] = None,
-        early_stopping_rounds: Optional[int] = None,
         verbose: Optional[Union[bool, int]] = True,
         xgb_model: Optional[Union[Booster, str, XGBModel]] = None,
         sample_weight_eval_set: Optional[Sequence[ArrayLike]] = None,
         base_margin_eval_set: Optional[Sequence[ArrayLike]] = None,
         feature_weights: Optional[ArrayLike] = None,
-        callbacks: Optional[Sequence[TrainingCallback]] = None,
     ) -> "XGBClassifier":
         # pylint: disable = attribute-defined-outside-init,too-many-statements
         with config_context(verbosity=self.verbosity):
@@ -1452,7 +1466,7 @@ class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
                 classes = cp.unique(y.values)
                 self.n_classes_ = len(classes)
                 expected_classes = cp.array(self.classes_)
-            elif _is_cupy_array(y):
+            elif _is_cupy_alike(y):
                 import cupy as cp  # pylint: disable=E0401
 
                 classes = cp.unique(y)
@@ -1486,15 +1500,7 @@ class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
                     params["objective"] = "multi:softprob"
                 params["num_class"] = self.n_classes_
 
-            (
-                model,
-                metric,
-                params,
-                early_stopping_rounds,
-                callbacks,
-            ) = self._configure_fit(
-                xgb_model, eval_metric, params, early_stopping_rounds, callbacks
-            )
+            model, metric, params = self._configure_fit(xgb_model, params)
             train_dmatrix, evals = _wrap_evaluation_matrices(
                 missing=self.missing,
                 X=X,
@@ -1519,13 +1525,13 @@ class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
                 train_dmatrix,
                 self.get_num_boosting_rounds(),
                 evals=evals,
-                early_stopping_rounds=early_stopping_rounds,
+                early_stopping_rounds=self.early_stopping_rounds,
                 evals_result=evals_result,
                 obj=obj,
                 custom_metric=metric,
                 verbose_eval=verbose,
                 xgb_model=model,
-                callbacks=callbacks,
+                callbacks=self.callbacks,
             )
 
             if not callable(self.objective):
@@ -1545,7 +1551,7 @@ class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
         output_margin: bool = False,
         validate_features: bool = True,
         base_margin: Optional[ArrayLike] = None,
-        iteration_range: Optional[Tuple[int, int]] = None,
+        iteration_range: Optional[IterationRange] = None,
     ) -> ArrayLike:
         with config_context(verbosity=self.verbosity):
             class_probs = super().predict(
@@ -1580,11 +1586,13 @@ class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
         X: ArrayLike,
         validate_features: bool = True,
         base_margin: Optional[ArrayLike] = None,
-        iteration_range: Optional[Tuple[int, int]] = None,
+        iteration_range: Optional[IterationRange] = None,
     ) -> np.ndarray:
         """Predict the probability of each `X` example being of a given class. If the
         model is trained with early stopping, then :py:attr:`best_iteration` is used
-        automatically.
+        automatically. The estimator uses `inplace_predict` by default and falls back to
+        using :py:class:`DMatrix` if devices between the data and the estimator don't
+        match.
 
         .. note:: This function is only thread safe for `gbtree` and `dart`.
 
@@ -1596,7 +1604,7 @@ class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
             When this is True, validate that the Booster's and data's feature_names are
             identical.  Otherwise, it is assumed that the feature_names are the same.
         base_margin :
-            Margin added to prediction.
+            Global bias for each instance. See :doc:`/tutorials/intercept` for details.
         iteration_range :
             Specifies which layer of trees are used in prediction.  For example, if a
             random forest is trained with 100 rounds.  Specifying `iteration_range=(10,
@@ -1636,10 +1644,6 @@ class XGBClassifier(XGBModel, XGBClassifierMixIn, XGBClassifierBase):
     @property
     def classes_(self) -> np.ndarray:
         return np.arange(self.n_classes_)
-
-    def load_model(self, fname: ModelIn) -> None:
-        super().load_model(fname)
-        self._load_model_attributes(self.get_booster())
 
 
 @xgboost_model_doc(
@@ -1689,17 +1693,14 @@ class XGBRFClassifier(XGBClassifier):
         sample_weight: Optional[ArrayLike] = None,
         base_margin: Optional[ArrayLike] = None,
         eval_set: Optional[Sequence[Tuple[ArrayLike, ArrayLike]]] = None,
-        eval_metric: Optional[Union[str, Sequence[str], Metric]] = None,
-        early_stopping_rounds: Optional[int] = None,
         verbose: Optional[Union[bool, int]] = True,
         xgb_model: Optional[Union[Booster, str, XGBModel]] = None,
         sample_weight_eval_set: Optional[Sequence[ArrayLike]] = None,
         base_margin_eval_set: Optional[Sequence[ArrayLike]] = None,
         feature_weights: Optional[ArrayLike] = None,
-        callbacks: Optional[Sequence[TrainingCallback]] = None,
     ) -> "XGBRFClassifier":
         args = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
-        _check_rf_callback(early_stopping_rounds, callbacks)
+        _check_rf_callback(self.early_stopping_rounds, self.callbacks)
         super().fit(**args)
         return self
 
@@ -1764,17 +1765,14 @@ class XGBRFRegressor(XGBRegressor):
         sample_weight: Optional[ArrayLike] = None,
         base_margin: Optional[ArrayLike] = None,
         eval_set: Optional[Sequence[Tuple[ArrayLike, ArrayLike]]] = None,
-        eval_metric: Optional[Union[str, Sequence[str], Metric]] = None,
-        early_stopping_rounds: Optional[int] = None,
         verbose: Optional[Union[bool, int]] = True,
         xgb_model: Optional[Union[Booster, str, XGBModel]] = None,
         sample_weight_eval_set: Optional[Sequence[ArrayLike]] = None,
         base_margin_eval_set: Optional[Sequence[ArrayLike]] = None,
         feature_weights: Optional[ArrayLike] = None,
-        callbacks: Optional[Sequence[TrainingCallback]] = None,
     ) -> "XGBRFRegressor":
         args = {k: v for k, v in locals().items() if k not in ("self", "__class__")}
-        _check_rf_callback(early_stopping_rounds, callbacks)
+        _check_rf_callback(self.early_stopping_rounds, self.callbacks)
         super().fit(**args)
         return self
 
@@ -1796,7 +1794,11 @@ def _get_qid(
 
 
 @xgboost_model_doc(
-    """Implementation of the Scikit-Learn API for XGBoost Ranking.""",
+    """Implementation of the Scikit-Learn API for XGBoost Ranking.
+
+See :doc:`Learning to Rank </tutorials/learning_to_rank>` for an introducion.
+
+    """,
     ["estimators", "model"],
     end_note="""
         .. note::
@@ -1845,7 +1847,7 @@ def _get_qid(
 class XGBRanker(XGBModel, XGBRankerMixIn):
     # pylint: disable=missing-docstring,too-many-arguments,invalid-name
     @_deprecate_positional_args
-    def __init__(self, *, objective: str = "rank:pairwise", **kwargs: Any):
+    def __init__(self, *, objective: str = "rank:ndcg", **kwargs: Any):
         super().__init__(objective=objective, **kwargs)
         if callable(self.objective):
             raise ValueError("custom objective function not supported by XGBRanker")
@@ -1875,14 +1877,11 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
         eval_set: Optional[Sequence[Tuple[ArrayLike, ArrayLike]]] = None,
         eval_group: Optional[Sequence[ArrayLike]] = None,
         eval_qid: Optional[Sequence[ArrayLike]] = None,
-        eval_metric: Optional[Union[str, Sequence[str], Metric]] = None,
-        early_stopping_rounds: Optional[int] = None,
         verbose: Optional[Union[bool, int]] = False,
         xgb_model: Optional[Union[Booster, str, XGBModel]] = None,
         sample_weight_eval_set: Optional[Sequence[ArrayLike]] = None,
         base_margin_eval_set: Optional[Sequence[ArrayLike]] = None,
         feature_weights: Optional[ArrayLike] = None,
-        callbacks: Optional[Sequence[TrainingCallback]] = None,
     ) -> "XGBRanker":
         # pylint: disable = attribute-defined-outside-init,arguments-differ
         """Fit gradient boosting ranker
@@ -1913,12 +1912,12 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
             | 1   | :math:`x_{20}` | :math:`x_{21}` |
             +-----+----------------+----------------+
 
-            When the ``tree_method`` is set to ``hist`` or ``gpu_hist``, internally, the
+            When the ``tree_method`` is set to ``hist``, internally, the
             :py:class:`QuantileDMatrix` will be used instead of the :py:class:`DMatrix`
             for conserving memory. However, this has performance implications when the
             device of input data is not matched with algorithm. For instance, if the
-            input is a numpy array on CPU but ``gpu_hist`` is used for training, then
-            the data is first processed on CPU then transferred to GPU.
+            input is a numpy array on CPU but ``cuda`` is used for training, then the
+            data is first processed on CPU then transferred to GPU.
         y :
             Labels
         group :
@@ -1939,7 +1938,7 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
                 weights to individual data points.
 
         base_margin :
-            Global bias for each instance.
+            Global bias for each instance. See :doc:`/tutorials/intercept` for details.
         eval_set :
             A list of (X, y) tuple pairs to use as validation sets, for which
             metrics will be computed.
@@ -1951,15 +1950,6 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
             A list in which ``eval_qid[i]`` is the array containing query ID of ``i``-th
             pair in **eval_set**. The special column convention in `X` applies to
             validation datasets as well.
-
-        eval_metric : str, list of str, optional
-            .. deprecated:: 1.6.0
-                use `eval_metric` in :py:meth:`__init__` or :py:meth:`set_params` instead.
-
-        early_stopping_rounds : int
-            .. deprecated:: 1.6.0
-                use `early_stopping_rounds` in :py:meth:`__init__` or
-                :py:meth:`set_params` instead.
 
         verbose :
             If `verbose` is True and an evaluation set is used, the evaluation metric
@@ -1988,10 +1978,6 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
             selected when colsample is being used.  All values must be greater than 0,
             otherwise a `ValueError` is thrown.
 
-        callbacks :
-            .. deprecated:: 1.6.0
-                Use `callbacks` in :py:meth:`__init__` or :py:meth:`set_params` instead.
-
         """
         with config_context(verbosity=self.verbosity):
             train_dmatrix, evals = _wrap_evaluation_matrices(
@@ -2016,27 +2002,19 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
             evals_result: TrainingCallback.EvalsLog = {}
             params = self.get_xgb_params()
 
-            (
-                model,
-                metric,
-                params,
-                early_stopping_rounds,
-                callbacks,
-            ) = self._configure_fit(
-                xgb_model, eval_metric, params, early_stopping_rounds, callbacks
-            )
+            model, metric, params = self._configure_fit(xgb_model, params)
 
             self._Booster = train(
                 params,
                 train_dmatrix,
-                self.get_num_boosting_rounds(),
-                early_stopping_rounds=early_stopping_rounds,
+                num_boost_round=self.get_num_boosting_rounds(),
+                early_stopping_rounds=self.early_stopping_rounds,
                 evals=evals,
                 evals_result=evals_result,
                 custom_metric=metric,
                 verbose_eval=verbose,
                 xgb_model=model,
-                callbacks=callbacks,
+                callbacks=self.callbacks,
             )
 
             self.objective = params["objective"]
@@ -2050,7 +2028,7 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
         output_margin: bool = False,
         validate_features: bool = True,
         base_margin: Optional[ArrayLike] = None,
-        iteration_range: Optional[Tuple[int, int]] = None,
+        iteration_range: Optional[IterationRange] = None,
     ) -> ArrayLike:
         X, _ = _get_qid(X, None)
         return super().predict(
@@ -2064,7 +2042,7 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
     def apply(
         self,
         X: ArrayLike,
-        iteration_range: Optional[Tuple[int, int]] = None,
+        iteration_range: Optional[IterationRange] = None,
     ) -> ArrayLike:
         X, _ = _get_qid(X, None)
         return super().apply(X, iteration_range)
@@ -2089,7 +2067,17 @@ class XGBRanker(XGBModel, XGBRankerMixIn):
 
         """
         X, qid = _get_qid(X, None)
-        Xyq = DMatrix(X, y, qid=qid)
+        # fixme(jiamingy): base margin and group weight is not yet supported. We might
+        # need to make extra special fields in the dataframe.
+        Xyq = DMatrix(
+            X,
+            y,
+            qid=qid,
+            missing=self.missing,
+            enable_categorical=self.enable_categorical,
+            nthread=self.n_jobs,
+            feature_types=self.feature_types,
+        )
         if callable(self.eval_metric):
             metric = ltr_metric_decorator(self.eval_metric, self.n_jobs)
             result_str = self.get_booster().eval_set([(Xyq, "eval")], feval=metric)

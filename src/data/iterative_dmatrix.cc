@@ -33,10 +33,10 @@ IterativeDMatrix::IterativeDMatrix(DataIterHandle iter_handle, DMatrixHandle pro
   bool valid = iter.Next();
   CHECK(valid) << "Iterative DMatrix must have at least 1 batch.";
 
-  auto d = MakeProxy(proxy_)->DeviceIdx();
+  auto pctx = MakeProxy(proxy_)->Ctx();
 
   Context ctx;
-  ctx.UpdateAllowUnknown(Args{{"nthread", std::to_string(nthread)}, {"gpu_id", std::to_string(d)}});
+  ctx.Init(Args{{"nthread", std::to_string(nthread)}, {"device", pctx->DeviceName()}});
   // hardcoded parameter.
   BatchParam p{max_bin, tree::TrainParam::DftSparseThreshold()};
 
@@ -95,7 +95,7 @@ void GetCutsFromRef(Context const* ctx, std::shared_ptr<DMatrix> ref, bst_featur
 
 namespace {
 // Synchronize feature type in case of empty DMatrix
-void SyncFeatureType(std::vector<FeatureType>* p_h_ft) {
+void SyncFeatureType(Context const*, std::vector<FeatureType>* p_h_ft) {
   if (!collective::IsDistributed()) {
     return;
   }
@@ -132,13 +132,13 @@ void IterativeDMatrix::InitFromCPU(Context const* ctx, BatchParam const& p,
     return HostAdapterDispatch(proxy, [](auto const& value) { return value.NumCols(); });
   };
 
-  std::vector<std::size_t> column_sizes;
+  std::vector<bst_idx_t> column_sizes;
   auto const is_valid = data::IsValidFunctor{missing};
   auto nnz_cnt = [&]() {
     return HostAdapterDispatch(proxy, [&](auto const& value) {
       size_t n_threads = ctx->Threads();
       size_t n_features = column_sizes.size();
-      linalg::Tensor<std::size_t, 2> column_sizes_tloc({n_threads, n_features}, Context::kCpuId);
+      linalg::Tensor<std::size_t, 2> column_sizes_tloc({n_threads, n_features}, DeviceOrd::CPU());
       column_sizes_tloc.Data()->Fill(0ul);
       auto view = column_sizes_tloc.HostView();
       common::ParallelFor(value.Size(), n_threads, common::Sched::Static(256), [&](auto i) {
@@ -193,7 +193,7 @@ void IterativeDMatrix::InitFromCPU(Context const* ctx, BatchParam const& p,
   // From here on Info() has the correct data shape
   Info().num_row_ = accumulated_rows;
   Info().num_nonzero_ = nnz;
-  Info().SynchronizeNumberOfColumns();
+  Info().SynchronizeNumberOfColumns(ctx);
   CHECK(std::none_of(column_sizes.cbegin(), column_sizes.cend(), [&](auto f) {
     return f > accumulated_rows;
   })) << "Something went wrong during iteration.";
@@ -213,9 +213,9 @@ void IterativeDMatrix::InitFromCPU(Context const* ctx, BatchParam const& p,
     while (iter.Next()) {
       if (!p_sketch) {
         h_ft = proxy->Info().feature_types.ConstHostVector();
-        SyncFeatureType(&h_ft);
-        p_sketch.reset(new common::HostSketchContainer{ctx, p.max_bin, h_ft, column_sizes,
-                                                       !proxy->Info().group_ptr_.empty()});
+        SyncFeatureType(ctx, &h_ft);
+        p_sketch = std::make_unique<common::HostSketchContainer>(ctx, p.max_bin, h_ft, column_sizes,
+                                                                 !proxy->Info().group_ptr_.empty());
       }
       HostAdapterDispatch(proxy, [&](auto const& batch) {
         proxy->Info().num_nonzero_ = batch_nnz[i];
@@ -230,7 +230,7 @@ void IterativeDMatrix::InitFromCPU(Context const* ctx, BatchParam const& p,
     CHECK_EQ(accumulated_rows, Info().num_row_);
 
     CHECK(p_sketch);
-    p_sketch->MakeCuts(Info(), &cuts);
+    p_sketch->MakeCuts(ctx, Info(), &cuts);
   }
   if (!h_ft.empty()) {
     CHECK_EQ(h_ft.size(), n_features);
@@ -240,9 +240,9 @@ void IterativeDMatrix::InitFromCPU(Context const* ctx, BatchParam const& p,
    * Generate gradient index.
    */
   this->ghist_ = std::make_unique<GHistIndexMatrix>(Info(), std::move(cuts), p.max_bin);
-  size_t rbegin = 0;
-  size_t prev_sum = 0;
-  size_t i = 0;
+  std::size_t rbegin = 0;
+  std::size_t prev_sum = 0;
+  std::size_t i = 0;
   while (iter.Next()) {
     HostAdapterDispatch(proxy, [&](auto const& batch) {
       proxy->Info().num_nonzero_ = batch_nnz[i];
@@ -366,8 +366,8 @@ inline void IterativeDMatrix::InitFromCUDA(Context const*, BatchParam const&, Da
   common::AssertGPUSupport();
 }
 
-inline BatchSet<EllpackPage> IterativeDMatrix::GetEllpackBatches(Context const* ctx,
-                                                                 BatchParam const& param) {
+inline BatchSet<EllpackPage> IterativeDMatrix::GetEllpackBatches(Context const*,
+                                                                 BatchParam const&) {
   common::AssertGPUSupport();
   auto begin_iter = BatchIterator<EllpackPage>(new SimpleBatchIteratorImpl<EllpackPage>(ellpack_));
   return BatchSet<EllpackPage>(BatchIterator<EllpackPage>(begin_iter));

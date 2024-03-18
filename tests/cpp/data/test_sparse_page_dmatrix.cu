@@ -5,6 +5,7 @@
 
 #include "../../../src/common/compressed_iterator.h"
 #include "../../../src/data/ellpack_page.cuh"
+#include "../../../src/data/ellpack_page.h"
 #include "../../../src/data/sparse_page_dmatrix.h"
 #include "../../../src/tree/param.h"  // TrainParam
 #include "../filesystem.h"            // dmlc::TemporaryDirectory
@@ -108,7 +109,7 @@ TEST(SparsePageDMatrix, RetainEllpackPage) {
 }
 
 TEST(SparsePageDMatrix, EllpackPageContent) {
-  auto ctx = CreateEmptyGenericParam(0);
+  auto ctx = MakeCUDACtx(0);
   constexpr size_t kRows = 6;
   constexpr size_t kCols = 2;
   constexpr size_t kPageSize = 1;
@@ -133,11 +134,11 @@ TEST(SparsePageDMatrix, EllpackPageContent) {
   size_t offset = 0;
   for (auto& batch : dmat_ext->GetBatches<EllpackPage>(&ctx, param)) {
     if (!impl_ext) {
-      impl_ext.reset(new EllpackPageImpl(
-          batch.Impl()->gidx_buffer.DeviceIdx(), batch.Impl()->Cuts(),
-          batch.Impl()->is_dense, batch.Impl()->row_stride, kRows));
+      impl_ext = std::make_unique<EllpackPageImpl>(batch.Impl()->gidx_buffer.Device(),
+                                                   batch.Impl()->Cuts(), batch.Impl()->is_dense,
+                                                   batch.Impl()->row_stride, kRows);
     }
-    auto n_elems = impl_ext->Copy(0, batch.Impl(), offset);
+    auto n_elems = impl_ext->Copy(ctx.Device(), batch.Impl(), offset);
     offset += n_elems;
   }
   EXPECT_EQ(impl_ext->base_rowid, 0);
@@ -197,10 +198,12 @@ TEST(SparsePageDMatrix, MultipleEllpackPageContent) {
     EXPECT_EQ(impl_ext->base_rowid, current_row);
 
     for (size_t i = 0; i < impl_ext->Size(); i++) {
-      dh::LaunchN(kCols, ReadRowFunction(impl->GetDeviceAccessor(0), current_row, row_d.data().get()));
+      dh::LaunchN(kCols, ReadRowFunction(impl->GetDeviceAccessor(ctx.Device()), current_row,
+                                         row_d.data().get()));
       thrust::copy(row_d.begin(), row_d.end(), row.begin());
 
-      dh::LaunchN(kCols, ReadRowFunction(impl_ext->GetDeviceAccessor(0), current_row, row_ext_d.data().get()));
+      dh::LaunchN(kCols, ReadRowFunction(impl_ext->GetDeviceAccessor(ctx.Device()), current_row,
+                                         row_ext_d.data().get()));
       thrust::copy(row_ext_d.begin(), row_ext_d.end(), row_ext.begin());
 
       EXPECT_EQ(row, row_ext);

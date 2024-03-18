@@ -23,12 +23,16 @@ Core Data Structure
     :show-inheritance:
 
 .. autoclass:: xgboost.QuantileDMatrix
+    :members:
     :show-inheritance:
 
 .. autoclass:: xgboost.Booster
     :members:
     :show-inheritance:
 
+.. autoclass:: xgboost.DataIter
+    :members:
+    :show-inheritance:
 
 Learning API
 ------------
@@ -84,22 +88,18 @@ Callback API
 
 .. autoclass:: xgboost.callback.EvaluationMonitor
     :members:
-    :inherited-members:
     :show-inheritance:
 
 .. autoclass:: xgboost.callback.EarlyStopping
     :members:
-    :inherited-members:
     :show-inheritance:
 
 .. autoclass:: xgboost.callback.LearningRateScheduler
     :members:
-    :inherited-members:
     :show-inheritance:
 
 .. autoclass:: xgboost.callback.TrainingCheckPoint
     :members:
-    :inherited-members:
     :show-inheritance:
 
 .. _dask_api:

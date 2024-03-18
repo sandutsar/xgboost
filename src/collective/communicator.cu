@@ -29,13 +29,22 @@ DeviceCommunicator* Communicator::GetDevice(int device_ordinal) {
     old_device_ordinal = device_ordinal;
     old_world_size = communicator_->GetWorldSize();
 #ifdef XGBOOST_USE_NCCL
-    if (type_ != CommunicatorType::kFederated) {
-      device_communicator_.reset(new NcclDeviceCommunicator(device_ordinal, Get()));
-    } else {
-      device_communicator_.reset(new DeviceCommunicatorAdapter(device_ordinal, Get()));
+    switch (type_) {
+      case CommunicatorType::kRabit:
+        device_communicator_.reset(new NcclDeviceCommunicator(device_ordinal, false, nccl_path_));
+        break;
+      case CommunicatorType::kFederated:
+      case CommunicatorType::kInMemory:
+        device_communicator_.reset(new DeviceCommunicatorAdapter(device_ordinal));
+        break;
+      case CommunicatorType::kInMemoryNccl:
+        device_communicator_.reset(new NcclDeviceCommunicator(device_ordinal, true, nccl_path_));
+        break;
+      default:
+        device_communicator_.reset(new NcclDeviceCommunicator(device_ordinal, false, nccl_path_));
     }
 #else
-    device_communicator_.reset(new DeviceCommunicatorAdapter(device_ordinal, Get()));
+    device_communicator_.reset(new DeviceCommunicatorAdapter(device_ordinal));
 #endif
   }
   return device_communicator_.get();

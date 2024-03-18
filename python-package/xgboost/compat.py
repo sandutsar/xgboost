@@ -88,6 +88,28 @@ def is_cudf_available() -> bool:
         return False
 
 
+def is_cupy_available() -> bool:
+    """Check cupy package available or not"""
+    if importlib.util.find_spec("cupy") is None:
+        return False
+    try:
+        import cupy
+
+        return True
+    except ImportError:
+        return False
+
+
+def import_cupy() -> types.ModuleType:
+    """Import cupy."""
+    if not is_cupy_available():
+        raise ImportError("`cupy` is required for handling CUDA buffer.")
+
+    import cupy  # pylint: disable=import-error
+
+    return cupy
+
+
 try:
     import scipy.sparse as scipy_sparse
     from scipy.sparse import csr_matrix as scipy_csr
@@ -116,9 +138,9 @@ def concat(value: Sequence[_T]) -> _T:  # pylint: disable=too-many-return-statem
         from cudf import concat as CUDF_concat  # pylint: disable=import-error
 
         return CUDF_concat(value, axis=0)
-    from .data import _is_cupy_array
+    from .data import _is_cupy_alike
 
-    if _is_cupy_array(value[0]):
+    if _is_cupy_alike(value[0]):
         import cupy  # pylint: disable=import-error
 
         # pylint: disable=c-extension-no-member,no-member

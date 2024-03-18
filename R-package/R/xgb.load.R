@@ -6,7 +6,7 @@
 #'
 #' @details
 #' The input file is expected to contain a model saved in an xgboost model format
-#' using either \code{\link{xgb.save}} or \code{\link{cb.save.model}} in R, or using some
+#' using either \code{\link{xgb.save}} or \code{\link{xgb.cb.save.model}} in R, or using some
 #' appropriate methods from other xgboost interfaces. E.g., a model trained in Python and
 #' saved from there in xgboost format, could be loaded from R.
 #'
@@ -17,38 +17,50 @@
 #' An object of \code{xgb.Booster} class.
 #'
 #' @seealso
-#' \code{\link{xgb.save}}, \code{\link{xgb.Booster.complete}}.
+#' \code{\link{xgb.save}}
 #'
 #' @examples
+#' \dontshow{RhpcBLASctl::omp_set_num_threads(1)}
 #' data(agaricus.train, package='xgboost')
 #' data(agaricus.test, package='xgboost')
+#'
+#' ## Keep the number of threads to 1 for examples
+#' nthread <- 1
+#' data.table::setDTthreads(nthread)
+#'
 #' train <- agaricus.train
 #' test <- agaricus.test
-#' bst <- xgboost(data = train$data, label = train$label, max_depth = 2,
-#'                eta = 1, nthread = 2, nrounds = 2,objective = "binary:logistic")
-#' xgb.save(bst, 'xgb.model')
-#' bst <- xgb.load('xgb.model')
-#' if (file.exists('xgb.model')) file.remove('xgb.model')
-#' pred <- predict(bst, test$data)
+#' bst <- xgb.train(
+#'   data = xgb.DMatrix(train$data, label = train$label),
+#'   max_depth = 2,
+#'   eta = 1,
+#'   nthread = nthread,
+#'   nrounds = 2,
+#'   objective = "binary:logistic"
+#' )
+#'
+#' fname <- file.path(tempdir(), "xgb.ubj")
+#' xgb.save(bst, fname)
+#' bst <- xgb.load(fname)
 #' @export
 xgb.load <- function(modelfile) {
   if (is.null(modelfile))
     stop("xgb.load: modelfile cannot be NULL")
 
-  handle <- xgb.Booster.handle(modelfile = modelfile)
+  bst <- xgb.Booster(
+    params = list(),
+    cachelist = list(),
+    modelfile = modelfile
+  )
+  bst <- bst$bst
   # re-use modelfile if it is raw so we do not need to serialize
   if (typeof(modelfile) == "raw") {
     warning(
       paste(
         "The support for loading raw booster with `xgb.load` will be ",
-        "discontinued in upcoming release. Use `xgb.load.raw` or",
-        " `xgb.unserialize` instead. "
+        "discontinued in upcoming release. Use `xgb.load.raw` instead. "
       )
     )
-    bst <- xgb.handleToBooster(handle, modelfile)
-  } else {
-    bst <- xgb.handleToBooster(handle, NULL)
   }
-  bst <- xgb.Booster.complete(bst, saveraw = TRUE)
   return(bst)
 }

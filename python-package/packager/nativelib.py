@@ -1,6 +1,7 @@
 """
 Functions for building libxgboost
 """
+
 import logging
 import os
 import pathlib
@@ -31,7 +32,10 @@ def build_libxgboost(
     build_dir: pathlib.Path,
     build_config: BuildConfiguration,
 ) -> pathlib.Path:
-    """Build libxgboost in a temporary directory and obtain the path to built libxgboost"""
+    """Build libxgboost in a temporary directory and obtain the path to built
+    libxgboost.
+
+    """
     logger = logging.getLogger("xgboost.packager.build_libxgboost")
 
     if not cpp_src_dir.is_dir():
@@ -50,8 +54,8 @@ def build_libxgboost(
         cmake_cmd.extend(build_config.get_cmake_args())
 
         # Flag for cross-compiling for Apple Silicon
-        # We use environment variable because it's the only way to pass down custom flags
-        # through the cibuildwheel package, which calls `pip wheel` command.
+        # We use environment variable because it's the only way to pass down custom
+        # flags through the cibuildwheel package, which calls `pip wheel` command.
         if "CIBW_TARGET_OSX_ARM64" in os.environ:
             cmake_cmd.append("-DCMAKE_OSX_ARCHITECTURES=arm64")
 
@@ -132,16 +136,28 @@ def locate_or_build_libxgboost(
 
     if build_config.use_system_libxgboost:
         # Find libxgboost from system prefix
-        sys_prefix = pathlib.Path(sys.prefix).absolute().resolve()
-        libxgboost_sys = sys_prefix / "lib" / _lib_name()
-        if not libxgboost_sys.exists():
-            raise RuntimeError(
-                f"use_system_libxgboost was specified but {_lib_name()} is "
-                f"not found in {libxgboost_sys.parent}"
-            )
-
-        logger.info("Using system XGBoost: %s", str(libxgboost_sys))
-        return libxgboost_sys
+        sys_prefix = pathlib.Path(sys.base_prefix)
+        sys_prefix_candidates = [
+            sys_prefix / "lib",
+            # Paths possibly used on Windows
+            sys_prefix / "bin",
+            sys_prefix / "Library",
+            sys_prefix / "Library" / "bin",
+            sys_prefix / "Library" / "lib",
+        ]
+        sys_prefix_candidates = [
+            p.expanduser().resolve() for p in sys_prefix_candidates
+        ]
+        for candidate_dir in sys_prefix_candidates:
+            libtreelite_sys = candidate_dir / _lib_name()
+            if libtreelite_sys.exists():
+                logger.info("Using system XGBoost: %s", str(libtreelite_sys))
+                return libtreelite_sys
+        raise RuntimeError(
+            f"use_system_libxgboost was specified but {_lib_name()} is "
+            f"not found. Paths searched (in order): \n"
+            + "\n".join([f"* {str(p)}" for p in sys_prefix_candidates])
+        )
 
     libxgboost = locate_local_libxgboost(toplevel_dir, logger=logger)
     if libxgboost is not None:

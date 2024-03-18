@@ -1,5 +1,5 @@
 /*!
- * Copyright 2022 by XGBoost Contributors
+ * Copyright 2022-2023 by XGBoost Contributors
  *
  * \brief Some components of GPU Hist evaluator, this file only exist to reduce nvcc
  *        compilation time.
@@ -12,12 +12,10 @@
 #include "evaluate_splits.cuh"
 #include "xgboost/data.h"
 
-namespace xgboost {
-namespace tree {
-void GPUHistEvaluator::Reset(common::HistogramCuts const &cuts,
-                                           common::Span<FeatureType const> ft,
-                                           bst_feature_t n_features, TrainParam const &param,
-                                           int32_t device) {
+namespace xgboost::tree {
+void GPUHistEvaluator::Reset(common::HistogramCuts const &cuts, common::Span<FeatureType const> ft,
+                             bst_feature_t n_features, TrainParam const &param,
+                             bool is_column_split, DeviceOrd device) {
   param_ = param;
   tree_evaluator_ = TreeEvaluator{param, n_features, device};
   has_categoricals_ = cuts.HasCategorical();
@@ -65,6 +63,8 @@ void GPUHistEvaluator::Reset(common::HistogramCuts const &cuts,
                         return fidx;
                       });
   }
+  is_column_split_ = is_column_split;
+  device_ = device;
 }
 
 common::Span<bst_feature_t const> GPUHistEvaluator::SortHistogram(
@@ -72,7 +72,7 @@ common::Span<bst_feature_t const> GPUHistEvaluator::SortHistogram(
     TreeEvaluator::SplitEvaluator<GPUTrainingParam> evaluator) {
   dh::XGBCachingDeviceAllocator<char> alloc;
   auto sorted_idx = this->SortedIdx(d_inputs.size(), shared_inputs.feature_values.size());
-  dh::Iota(sorted_idx);
+  dh::Iota(sorted_idx, dh::DefaultStream());
   auto data = this->SortInput(d_inputs.size(), shared_inputs.feature_values.size());
   auto it = thrust::make_counting_iterator(0u);
   auto d_feature_idx = dh::ToSpan(feature_idx_);
@@ -126,6 +126,4 @@ common::Span<bst_feature_t const> GPUHistEvaluator::SortHistogram(
                              });
   return dh::ToSpan(cat_sorted_idx_);
 }
-
-}  // namespace tree
-}  // namespace xgboost
+}  // namespace xgboost::tree
